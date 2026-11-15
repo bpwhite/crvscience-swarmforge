@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software repository and the CRV Science Apps hub."
+type: software
+title: "SwarmForge: 3D Isometric Automated Robotic Factory and Swarm Intelligence Simulation Game"
+version: "1.3.0"
+date-released: "2026-11-15"
+url: "https://crvscience.com/apps"
+repository-code: "https://github.com/bpwhite/crvscience-swarmforge"
+license: "MIT"
+authors:
+  - family-names: "White"
+    given-names: "Bryan P."
+    affiliation: "CRV Science Labs"
+keywords:
+  - "swarm robotics"
+  - "multi-agent systems"
+  - "isometric factory"
+  - "simulation game"
+  - "Rust"
