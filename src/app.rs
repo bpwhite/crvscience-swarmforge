@@ -54,10 +54,32 @@ impl SwarmForgeApp {
             status_banner: "Ready — Spacious 2-bay clearance & solid robot collision active.".to_string(),
         }
     }
+
+    pub fn new_headless(mut state: GameState) -> Self {
+        enforce_spacing_and_migrate(&mut state);
+        Self {
+            state,
+            camera: IsoCamera::default(),
+            tab: SidebarTab::Robots,
+            sim_speed: 1.0,
+            paused: true,
+            last_frame: Instant::now(),
+            save_store: None,
+            slot_input: "slot_1".to_string(),
+            json_path_input: "swarmforge_save.json".to_string(),
+            status_banner: "Ready — Spacious 2-bay clearance & solid robot collision active.".to_string(),
+        }
+    }
 }
 
 impl eframe::App for SwarmForgeApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.ui_step(ctx);
+    }
+}
+
+impl SwarmForgeApp {
+    pub fn ui_step(&mut self, ctx: &Context) {
         let now = Instant::now();
         let raw_dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -549,4 +571,241 @@ impl SwarmForgeApp {
             render_isometric_factory(&painter, rect, &self.state, &self.camera);
         });
     }
+}
+
+fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
+    struct NoopWake;
+    impl std::task::Wake for NoopWake {
+        fn wake(self: std::sync::Arc<Self>) {}
+    }
+    let waker = std::task::Waker::from(std::sync::Arc::new(NoopWake));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(val) => return val,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+fn write_rgba_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let file = std::fs::File::create(path)?;
+    let w = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    Ok(())
+}
+
+/// Render an offscreen 1600x1000 RGBA PNG screenshot without opening any OS GUI window.
+pub fn render_headless_screenshot(
+    state: GameState,
+    _db_path: &std::path::Path,
+    out_path: &std::path::Path,
+    view: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use eframe::egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
+
+    let width: u32 = 1600;
+    let height: u32 = 1000;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = block_on_future(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .ok_or("No GPU adapter available for offscreen rendering")?;
+    let (device, queue) = block_on_future(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("swarmforge-offscreen-device"),
+            ..Default::default()
+        },
+        None,
+    ))?;
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("swarmforge-offscreen-target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bytes_per_row = width * 4;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("swarmforge-offscreen-staging"),
+        size: (bytes_per_row * height) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut renderer = Renderer::new(&device, format, None, 1, false);
+    let egui_ctx = Context::default();
+    egui_ctx.set_pixels_per_point(1.0);
+
+    let mut app = SwarmForgeApp::new_headless(state);
+
+    if view == 1 {
+        // View 1: Default 3D Isometric Factory & Swarm Robots view
+        app.tab = SidebarTab::Robots;
+        app.camera.view_mode = FloorViewMode::Single(FloorId::MainFloor);
+        for _ in 0..120 {
+            tick_factory(&mut app.state, 0.1);
+        }
+    } else if view == 2 {
+        // View 2: Multi-floor / Tech-Tree / Swarm Scaling view
+        app.tab = SidebarTab::SwarmTech;
+        app.camera.view_mode = FloorViewMode::AllFloorsCutaway;
+        app.camera.zoom = 24.0;
+        app.state.credits += 5000.0;
+        app.state.research_points += 500.0;
+        for node in TECH_TREE.iter().take(4) {
+            let _ = unlock_tech(&mut app.state, node.id);
+        }
+        let _ = purchase_robot(&mut app.state, RobotKind::Assembler);
+        let _ = purchase_robot(&mut app.state, RobotKind::Hauler);
+        let _ = purchase_robot(&mut app.state, RobotKind::Researcher);
+        let _ = purchase_robot(&mut app.state, RobotKind::Maintenance);
+        for _ in 0..80 {
+            tick_factory(&mut app.state, 0.1);
+        }
+    } else if view == 3 {
+        // View 3: Disaster Suppression / Fire & Cheer Drone view
+        app.tab = SidebarTab::Modules;
+        app.camera.view_mode = FloorViewMode::Single(FloorId::MainFloor);
+        app.state.credits += 5000.0;
+        let _ = purchase_module(&mut app.state, ModuleKind::FireSuppressionTower);
+        let _ = purchase_robot(&mut app.state, RobotKind::RepairBot);
+        let _ = purchase_robot(&mut app.state, RobotKind::MotivationDrone);
+        for _ in 0..40 {
+            tick_factory(&mut app.state, 0.1);
+        }
+        crate::disasters::spawn_random_disaster(&mut app.state);
+        for _ in 0..15 {
+            tick_factory(&mut app.state, 0.1);
+        }
+    }
+
+    let warmup_delays_ms = [50u64, 30, 20, 20];
+    for (frame_idx, delay_ms) in warmup_delays_ms.into_iter().enumerate() {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width as f32, height as f32),
+            )),
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(1.0),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            time: Some(frame_idx as f64 / 60.0),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            app.ui_step(ctx);
+        });
+        for (id, image_delta) in &full_output.textures_delta.set {
+            renderer.update_texture(&device, &queue, *id, image_delta);
+        }
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [width, height],
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("swarmforge-offscreen-encoder"),
+        });
+        let user_cmd_bufs = renderer.update_buffers(
+            &device,
+            &queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("swarmforge-offscreen-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            let mut render_pass = render_pass.forget_lifetime();
+            renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
+        }
+        if frame_idx == 3 {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(user_cmd_bufs.into_iter().chain(std::iter::once(encoder.finish())));
+        device.poll(wgpu::Maintain::Wait);
+        for id in &full_output.textures_delta.free {
+            renderer.free_texture(id);
+        }
+    }
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv()??;
+    let mapped = slice.get_mapped_range();
+    write_rgba_png(out_path, width, height, &mapped)?;
+    drop(mapped);
+    staging.unmap();
+    Ok(())
 }

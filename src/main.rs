@@ -26,6 +26,14 @@ struct Cli {
 
     #[arg(long)]
     export_json: Option<PathBuf>,
+
+    /// Render an offscreen 1600x1000 RGBA PNG screenshot without opening a GUI window
+    #[arg(long)]
+    headless_screenshot: Option<PathBuf>,
+
+    /// Select preset view (1, 2, or 3) for --headless-screenshot
+    #[arg(long, default_value_t = 1)]
+    screenshot_view: u8,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,6 +65,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             export_json_file(out, &state)?;
             println!("Exported state JSON to {}", out.display());
         }
+        return Ok(());
+    }
+
+    if let Some(ref out_path) = cli.headless_screenshot {
+        swarmforge::app::render_headless_screenshot(
+            state,
+            &cli.db_path,
+            out_path,
+            cli.screenshot_view,
+        )?;
         return Ok(());
     }
 

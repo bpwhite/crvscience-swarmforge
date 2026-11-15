@@ -1,5 +1,7 @@
 # SwarmForge (`swarmforge` v1.3.0)
 
+![SwarmForge 3D Isometric Robotic Factory & Swarm Robots View](validation/headless_screenshot.png)
+
 Native safe-Rust (`#![forbid(unsafe_code)]`) 3D isometric automated robotic factory simulation game featuring **bespoke articulated 3D CAD models**, **industrial disasters & fire suppression turrets**, **routine robot maintenance (`RepairBot` + `BotRepairStation`)**, **overhead cheering `MotivationDrone`s**, **periodic outbound cargo drone sorties**, **progressive 6-tier non-obstructing warehouse flare**, **indoor ambient micro-drones**, and **tri-grid (`0.8u`) A* collision-free navigation**.
 
 ## What's New in v1.3.0

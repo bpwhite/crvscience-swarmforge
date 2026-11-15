@@ -1,9 +1,10 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite both the software repository and the CRV Science Apps hub."
+message: "If you use this software or its validation datasets, please cite both the software repository and the accompanying CRV Science Apps monograph."
 type: software
 title: "SwarmForge: 3D Isometric Automated Robotic Factory and Swarm Intelligence Simulation Game"
 version: "1.3.0"
 date-released: "2026-11-15"
+doi: "10.5281/zenodo.24244093"
 url: "https://crvscience.com/apps"
 repository-code: "https://github.com/bpwhite/crvscience-swarmforge"
 license: "MIT"
@@ -17,3 +18,15 @@ keywords:
   - "isometric factory"
   - "simulation game"
   - "Rust"
+preferred-citation:
+  type: article
+  title: "SwarmForge: 3D Isometric Automated Factory and Swarm Robotics Simulation Game"
+  authors:
+    - family-names: "White"
+      given-names: "Bryan P."
+      affiliation: "CRV Science Labs"
+  year: 2026
+  journal: "CRV Science Apps Preprints"
+  doi: "10.5281/zenodo.24244093"
+  url: "https://crvscience.com/apps/preprints/swarmforge-isometric-swarm-factory-game"
+  notes: "Preprint ID: APP-PREPRINT-18"
