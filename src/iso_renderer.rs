@@ -79,6 +79,76 @@ impl IsoCamera {
     }
 }
 
+fn push_subdivided_axis_box(
+    parts: &mut Vec<BoxPart>,
+    center: Vec3,
+    size: Vec3,
+    rgb: [u8; 3],
+    max_segment_len: f32,
+) {
+    let step = max_segment_len.max(0.5);
+    if size.x > step && size.x >= size.z {
+        let count = (size.x / step).ceil().max(1.0) as usize;
+        let seg_x = size.x / (count as f32);
+        let start_x = center.x - 0.5 * size.x + 0.5 * seg_x;
+        for i in 0..count {
+            parts.push(BoxPart::axis_aligned(
+                Vec3::new(start_x + (i as f32) * seg_x, center.y, center.z),
+                Vec3::new(seg_x, size.y, size.z),
+                rgb,
+            ));
+        }
+    } else if size.z > step {
+        let count = (size.z / step).ceil().max(1.0) as usize;
+        let seg_z = size.z / (count as f32);
+        let start_z = center.z - 0.5 * size.z + 0.5 * seg_z;
+        for i in 0..count {
+            parts.push(BoxPart::axis_aligned(
+                Vec3::new(center.x, center.y, start_z + (i as f32) * seg_z),
+                Vec3::new(size.x, size.y, seg_z),
+                rgb,
+            ));
+        }
+    } else {
+        parts.push(BoxPart::axis_aligned(center, size, rgb));
+    }
+}
+
+fn emit_parts_mesh(
+    painter: &Painter,
+    cam: &IsoCamera,
+    view: &Mat4,
+    sun_dir: Vec3,
+    rect: Rect,
+    focus_y: f32,
+    parts: &[BoxPart],
+) {
+    if parts.is_empty() {
+        return;
+    }
+    let mut quads: Vec<ProjectedQuad> = Vec::with_capacity(parts.len() * 3);
+    for part in parts {
+        emit_oriented_box(&mut quads, cam, view, sun_dir, rect, focus_y, part);
+    }
+    quads.sort_by(|a, b| {
+        a.depth
+            .partial_cmp(&b.depth)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut mesh = Mesh::default();
+    for q in &quads {
+        let base = mesh.vertices.len() as u32;
+        mesh.colored_vertex(q.pts[0], q.color);
+        mesh.colored_vertex(q.pts[1], q.color);
+        mesh.colored_vertex(q.pts[2], q.color);
+        mesh.colored_vertex(q.pts[3], q.color);
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base, base + 2, base + 3);
+    }
+    painter.add(Shape::Mesh(Arc::new(mesh)));
+}
+
 pub fn render_isometric_factory(
     painter: &Painter,
     rect: Rect,
@@ -91,10 +161,8 @@ pub fn render_isometric_factory(
         FloorViewMode::Single(f) => f.world_y(),
         FloorViewMode::AllFloorsCutaway => 2.8,
     };
-
-    let mut parts: Vec<BoxPart> = Vec::with_capacity(4096);
-    let mut overlays: Vec<(Pos2, Pos2, Stroke)> = Vec::new();
-    let mut badges: Vec<(Pos2, String, Color32)> = Vec::new();
+    let view = cam.view_matrix(focus_y);
+    let sun_dir = Vec3::new(0.48, 0.76, 0.43).normalize();
     let time_s = state.elapsed_secs as f32;
 
     for floor in FloorId::ALL {
@@ -121,48 +189,87 @@ pub fn render_isometric_factory(
             FloorId::TechResearch => [27, 46, 60],
             FloorId::Administration => [40, 38, 54],
         };
-        parts.push(BoxPart::axis_aligned(
+
+        // Pass A: Floor slab Shape::Mesh only (guaranteed behind Pass B & Pass C on this floor).
+        let slab_part = [BoxPart::axis_aligned(
             Vec3::new(-0.5 * CELL_PITCH, fy - 0.18, -0.5 * CELL_PITCH),
             Vec3::new(half * 2.0, 0.36, half * 2.0),
             slab_rgb,
-        ));
+        )];
+        emit_parts_mesh(painter, cam, &view, sun_dir, rect, focus_y, &slab_part);
 
-        let grid_stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(90, 125, 160, 42));
+        // Pass B: Floor tile grid lines & pheromone trails (above slab, strictly below entities).
+        let grid_stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(90, 125, 160, 42));
+        let min_c = (-half_cells as f32 - 0.5) * CELL_PITCH;
+        let max_c = (half_cells as f32 - 0.5) * CELL_PITCH;
         for i in -half_cells..=half_cells {
             let coord = (i as f32 - 0.5) * CELL_PITCH;
-            let min_c = (-half_cells as f32 - 0.5) * CELL_PITCH;
-            let max_c = (half_cells as f32 - 0.5) * CELL_PITCH;
             let (a1, _) = cam.project(Vec3::new(coord, fy + 0.01, min_c), rect, focus_y);
             let (a2, _) = cam.project(Vec3::new(coord, fy + 0.01, max_c), rect, focus_y);
-            overlays.push((a1, a2, grid_stroke));
+            painter.line_segment([a1, a2], grid_stroke);
             let (b1, _) = cam.project(Vec3::new(min_c, fy + 0.01, coord), rect, focus_y);
             let (b2, _) = cam.project(Vec3::new(max_c, fy + 0.01, coord), rect, focus_y);
-            overlays.push((b1, b2, grid_stroke));
+            painter.line_segment([b1, b2], grid_stroke);
         }
+
+        if floor == FloorId::MainFloor {
+            for edge in &state.pheromones {
+                let src = state.modules.iter().find(|m| m.id == edge.from_id);
+                let dst = state.modules.iter().find(|m| m.id == edge.to_id);
+                if let (Some(s), Some(d)) = (src, dst) {
+                    let (p1, _) =
+                        cam.project(Vec3::new(s.visual_x, fy + 0.12, s.visual_z), rect, focus_y);
+                    let (p2, _) =
+                        cam.project(Vec3::new(d.visual_x, fy + 0.12, d.visual_z), rect, focus_y);
+                    let alpha = (edge.intensity * 190.0) as u8;
+                    painter.line_segment(
+                        [p1, p2],
+                        Stroke::new(2.2_f32, Color32::from_rgba_unmultiplied(40, 235, 220, alpha)),
+                    );
+                }
+            }
+        }
+
+        // Pass C: All above-floor 3D boxes (robots, modules, shafts, drones, disasters, bollards)
+        // with long spanning basement pipes & Tier-4 busbars subdivided into ~2.0u segments.
+        let mut parts: Vec<BoxPart> = Vec::with_capacity(1024);
+        let mut entity_overlays: Vec<(Pos2, Pos2, Stroke)> = Vec::new();
+        let mut badges: Vec<(Pos2, String, Color32)> = Vec::new();
 
         if floor == FloorId::Basement {
             let pipe_span = half * 1.65;
-            parts.push(BoxPart::axis_aligned(
+            push_subdivided_axis_box(
+                &mut parts,
                 Vec3::new(0.0, fy + 0.14, -4.5 * CELL_PITCH),
                 Vec3::new(pipe_span, 0.20, 0.22),
                 [217, 119, 6],
-            ));
-            parts.push(BoxPart::axis_aligned(
+                2.0,
+            );
+            push_subdivided_axis_box(
+                &mut parts,
                 Vec3::new(-4.5 * CELL_PITCH, fy + 0.14, 0.0),
                 Vec3::new(0.22, 0.20, pipe_span),
                 [14, 165, 233],
-            ));
-            parts.push(BoxPart::axis_aligned(
+                2.0,
+            );
+            push_subdivided_axis_box(
+                &mut parts,
                 Vec3::new(3.5 * CELL_PITCH, fy + 0.14, 0.0),
                 Vec3::new(0.22, 0.20, pipe_span),
                 [16, 185, 129],
-            ));
+                2.0,
+            );
         }
 
         // Vertical Freight & Utility Shaft anchored cleanly at grid (-3, -3)
         let sx = -3.0 * CELL_PITCH;
         let sz = -3.0 * CELL_PITCH;
-        for (px, pz) in [(sx - 0.65, sz - 0.65), (sx + 0.65, sz - 0.65), (sx - 0.65, sz + 0.65), (sx + 0.65, sz + 0.65)] {
+        for (px, pz) in [
+            (sx - 0.65, sz - 0.65),
+            (sx + 0.65, sz - 0.65),
+            (sx - 0.65, sz + 0.65),
+            (sx + 0.65, sz + 0.65),
+        ] {
             parts.push(BoxPart::axis_aligned(
                 Vec3::new(px, fy + 1.35, pz),
                 Vec3::new(0.16, 2.70, 0.16),
@@ -183,36 +290,34 @@ pub fn render_isometric_factory(
             Color32::from_rgb(155, 205, 255),
         ));
 
-        if floor == FloorId::MainFloor {
-            for edge in &state.pheromones {
-                let src = state.modules.iter().find(|m| m.id == edge.from_id);
-                let dst = state.modules.iter().find(|m| m.id == edge.to_id);
-                if let (Some(s), Some(d)) = (src, dst) {
-                    let (p1, _) =
-                        cam.project(Vec3::new(s.visual_x, fy + 0.12, s.visual_z), rect, focus_y);
-                    let (p2, _) =
-                        cam.project(Vec3::new(d.visual_x, fy + 0.12, d.visual_z), rect, focus_y);
-                    let alpha = (edge.intensity * 190.0) as u8;
-                    overlays.push((
-                        p1,
-                        p2,
-                        Stroke::new(2.2, Color32::from_rgba_unmultiplied(40, 235, 220, alpha)),
-                    ));
-                }
-            }
-        }
-
         // Non-Obstructing Progressive Perimeter Warehouse Flare (Tiers 1..=6, outside walkable slab!)
         if floor == FloorId::MainFloor {
             let rim = half + 0.55;
             let tier = state.warehouse_flare_tier;
             // Tier 1+: Corner safety bollards
-            for &(cx, cz) in &[(-rim, -rim), (rim - 1.2, -rim), (-rim, rim - 1.2), (rim - 1.2, rim - 1.2)] {
-                parts.push(BoxPart::axis_aligned(Vec3::new(cx, fy + 0.45, cz), Vec3::new(0.24, 0.90, 0.24), [245, 158, 11]));
+            for &(cx, cz) in &[
+                (-rim, -rim),
+                (rim - 1.2, -rim),
+                (-rim, rim - 1.2),
+                (rim - 1.2, rim - 1.2),
+            ] {
+                parts.push(BoxPart::axis_aligned(
+                    Vec3::new(cx, fy + 0.45, cz),
+                    Vec3::new(0.24, 0.90, 0.24),
+                    [245, 158, 11],
+                ));
                 if tier >= 2 {
                     // Floodlight stanchions
-                    parts.push(BoxPart::axis_aligned(Vec3::new(cx, fy + 1.85, cz), Vec3::new(0.14, 2.20, 0.14), [100, 116, 139]));
-                    parts.push(BoxPart::axis_aligned(Vec3::new(cx, fy + 2.95, cz), Vec3::new(0.48, 0.18, 0.48), [253, 224, 71]));
+                    parts.push(BoxPart::axis_aligned(
+                        Vec3::new(cx, fy + 1.85, cz),
+                        Vec3::new(0.14, 2.20, 0.14),
+                        [100, 116, 139],
+                    ));
+                    parts.push(BoxPart::axis_aligned(
+                        Vec3::new(cx, fy + 2.95, cz),
+                        Vec3::new(0.48, 0.18, 0.48),
+                        [253, 224, 71],
+                    ));
                 }
                 if tier >= 5 {
                     // Spinning holographic corner pylons
@@ -226,12 +331,30 @@ pub fn render_isometric_factory(
             }
             if tier >= 3 {
                 // Digital Scoreboard Gantry on back perimeter (-rim)
-                parts.push(BoxPart::axis_aligned(Vec3::new(0.0, fy + 2.40, -rim), Vec3::new(4.6, 0.85, 0.18), [15, 23, 42]));
-                parts.push(BoxPart::axis_aligned(Vec3::new(0.0, fy + 2.40, -rim + 0.10), Vec3::new(4.2, 0.55, 0.05), [34, 211, 238]));
+                push_subdivided_axis_box(
+                    &mut parts,
+                    Vec3::new(0.0, fy + 2.40, -rim),
+                    Vec3::new(4.6, 0.85, 0.18),
+                    [15, 23, 42],
+                    2.0,
+                );
+                push_subdivided_axis_box(
+                    &mut parts,
+                    Vec3::new(0.0, fy + 2.40, -rim + 0.10),
+                    Vec3::new(4.2, 0.55, 0.05),
+                    [34, 211, 238],
+                    2.0,
+                );
             }
             if tier >= 4 {
                 // High-clearance overhead cyan gantry busbar truss (y = 4.1u, completely above bots & fabs!)
-                parts.push(BoxPart::axis_aligned(Vec3::new(-0.5 * CELL_PITCH, fy + 4.10, 0.0), Vec3::new(half * 1.85, 0.12, 0.18), [56, 189, 248]));
+                push_subdivided_axis_box(
+                    &mut parts,
+                    Vec3::new(-0.5 * CELL_PITCH, fy + 4.10, 0.0),
+                    Vec3::new(half * 1.85, 0.12, 0.18),
+                    [56, 189, 248],
+                    2.0,
+                );
             }
             if tier >= 6 {
                 // Golden Swarm Monument on front perimeter
@@ -252,8 +375,16 @@ pub fn render_isometric_factory(
                 let rx = (ang.cos() * (half * 0.62)) - 0.5 * CELL_PITCH;
                 let rz = ((ang * 2.0).sin() * (half * 0.42)) - 0.5 * CELL_PITCH;
                 let dy = fy + 3.35 + (time_s * 2.5 + di as f32).sin() * 0.15;
-                parts.push(BoxPart::axis_aligned(Vec3::new(rx, dy, rz), Vec3::new(0.32, 0.10, 0.32), [148, 163, 184]));
-                parts.push(BoxPart::axis_aligned(Vec3::new(rx, dy - 0.08, rz), Vec3::new(0.12, 0.08, 0.12), [56, 235, 255]));
+                parts.push(BoxPart::axis_aligned(
+                    Vec3::new(rx, dy, rz),
+                    Vec3::new(0.32, 0.10, 0.32),
+                    [148, 163, 184],
+                ));
+                parts.push(BoxPart::axis_aligned(
+                    Vec3::new(rx, dy - 0.08, rz),
+                    Vec3::new(0.12, 0.08, 0.12),
+                    [56, 235, 255],
+                ));
             }
         }
 
@@ -268,19 +399,40 @@ pub fn render_isometric_factory(
             };
             parts.push(BoxPart::oriented(
                 Vec3::new(d.x, fy + 1.65 + flicker, d.z),
-                Vec3::new(0.55 * d.severity.max(0.4), 0.78 + flicker, 0.55 * d.severity.max(0.4)),
+                Vec3::new(
+                    0.55 * d.severity.max(0.4),
+                    0.78 + flicker,
+                    0.55 * d.severity.max(0.4),
+                ),
                 Quat::from_rotation_y(time_s * 5.0),
                 col,
             ));
             let (dp, _) = cam.project(Vec3::new(d.x, fy + 2.45, d.z), rect, focus_y);
-            badges.push((dp, format!("⚠ {}", d.kind.label()), Color32::from_rgb(255, 110, 75)));
+            badges.push((
+                dp,
+                format!("⚠ {}", d.kind.label()),
+                Color32::from_rgb(255, 110, 75),
+            ));
 
             if d.suppressed_by_tower {
-                for tm in state.modules.iter().filter(|m| m.floor == floor && m.kind == crate::model::ModuleKind::FireSuppressionTower) {
-                    if (tm.visual_x - d.x).hypot(tm.visual_z - d.z) <= crate::disasters::SUPPRESSION_RADIUS {
-                        let (p1, _) = cam.project(Vec3::new(tm.visual_x, fy + 1.38, tm.visual_z), rect, focus_y);
-                        let (p2, _) = cam.project(Vec3::new(d.x, fy + 1.25, d.z), rect, focus_y);
-                        overlays.push((p1, p2, Stroke::new(3.0, Color32::from_rgb(186, 230, 253))));
+                for tm in state.modules.iter().filter(|m| {
+                    m.floor == floor && m.kind == crate::model::ModuleKind::FireSuppressionTower
+                }) {
+                    if (tm.visual_x - d.x).hypot(tm.visual_z - d.z)
+                        <= crate::disasters::SUPPRESSION_RADIUS
+                    {
+                        let (p1, _) = cam.project(
+                            Vec3::new(tm.visual_x, fy + 1.38, tm.visual_z),
+                            rect,
+                            focus_y,
+                        );
+                        let (p2, _) =
+                            cam.project(Vec3::new(d.x, fy + 1.25, d.z), rect, focus_y);
+                        entity_overlays.push((
+                            p1,
+                            p2,
+                            Stroke::new(3.0_f32, Color32::from_rgb(186, 230, 253)),
+                        ));
                     }
                 }
             }
@@ -307,10 +459,13 @@ pub fn render_isometric_factory(
                     if (a.x - b.x).powi(2) + (a.z - b.z).powi(2) < 32.0 {
                         let (pa, _) = cam.project(Vec3::new(a.x, fy + 0.95, a.z), rect, focus_y);
                         let (pb, _) = cam.project(Vec3::new(b.x, fy + 0.95, b.z), rect, focus_y);
-                        overlays.push((
+                        entity_overlays.push((
                             pa,
                             pb,
-                            Stroke::new(1.2, Color32::from_rgba_unmultiplied(120, 220, 255, 95)),
+                            Stroke::new(
+                                1.2_f32,
+                                Color32::from_rgba_unmultiplied(120, 220, 255, 95),
+                            ),
                         ));
                     }
                 }
@@ -325,54 +480,34 @@ pub fn render_isometric_factory(
             {
                 let (p1, _) = cam.project(Vec3::new(r.x, fy + 0.88, r.z), rect, focus_y);
                 let (p2, _) = cam.project(
-                    Vec3::new(dest_gx as f32 * CELL_PITCH, fy + 0.18, dest_gz as f32 * CELL_PITCH),
+                    Vec3::new(
+                        dest_gx as f32 * CELL_PITCH,
+                        fy + 0.18,
+                        dest_gz as f32 * CELL_PITCH,
+                    ),
                     rect,
                     focus_y,
                 );
-                overlays.push((p1, p2, Stroke::new(2.2, Color32::from_rgb(255, 195, 55))));
+                entity_overlays.push((p1, p2, Stroke::new(2.2_f32, Color32::from_rgb(255, 195, 55))));
             }
         }
-    }
 
-    let mut quads: Vec<ProjectedQuad> = Vec::with_capacity(parts.len() * 3);
-    let view = cam.view_matrix(focus_y);
-    let sun_dir = Vec3::new(0.48, 0.76, 0.43).normalize();
+        emit_parts_mesh(painter, cam, &view, sun_dir, rect, focus_y, &parts);
 
-    for part in &parts {
-        emit_oriented_box(&mut quads, cam, &view, sun_dir, rect, focus_y, part);
-    }
+        for (p1, p2, stroke) in entity_overlays {
+            painter.line_segment([p1, p2], stroke);
+        }
 
-    quads.sort_by(|a, b| {
-        a.depth
-            .partial_cmp(&b.depth)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut mesh = Mesh::default();
-    for q in &quads {
-        let base = mesh.vertices.len() as u32;
-        mesh.colored_vertex(q.pts[0], q.color);
-        mesh.colored_vertex(q.pts[1], q.color);
-        mesh.colored_vertex(q.pts[2], q.color);
-        mesh.colored_vertex(q.pts[3], q.color);
-        mesh.add_triangle(base, base + 1, base + 2);
-        mesh.add_triangle(base, base + 2, base + 3);
-    }
-    painter.add(Shape::Mesh(Arc::new(mesh)));
-
-    for (p1, p2, stroke) in overlays {
-        painter.line_segment([p1, p2], stroke);
-    }
-
-    for (pos, text, col) in badges {
-        if rect.contains(pos) {
-            painter.text(
-                pos,
-                Align2::LEFT_BOTTOM,
-                text,
-                FontId::proportional(11.5),
-                col,
-            );
+        for (pos, text, col) in badges {
+            if rect.contains(pos) {
+                painter.text(
+                    pos,
+                    Align2::LEFT_BOTTOM,
+                    text,
+                    FontId::proportional(11.5),
+                    col,
+                );
+            }
         }
     }
 }
@@ -418,7 +553,7 @@ fn emit_oriented_box(
             (part.rot * local_n).normalize()
         };
         let vn = view.transform_vector3(world_n);
-        if vn.z <= -0.02 {
+        if vn.z <= 0.0001 {
             continue;
         }
         let mut pts = [Pos2::ZERO; 4];
@@ -438,5 +573,76 @@ fn emit_oriented_box(
             depth: z_sum * 0.25,
             color: Color32::from_rgb(r, g, b),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::GameState;
+    use egui::{LayerId, Order};
+
+    #[test]
+    fn floor_passes_render_slab_then_grid_then_entities_without_back_occlusion() {
+        let mut state = GameState::new_starter_factory();
+        state.main_floor_half_extent = 13; // 26x26 megafactory floor
+        state.warehouse_flare_tier = 5;
+
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let mut cam = IsoCamera::default();
+        cam.view_mode = FloorViewMode::Single(FloorId::MainFloor);
+
+        let full = ctx.run(egui::RawInput::default(), |c| {
+            let painter = Painter::new(c.clone(), LayerId::new(Order::Middle, egui::Id::new("t")), rect);
+            render_isometric_factory(&painter, rect, &state, &cam);
+        });
+
+        // Shape 0: background rect_filled
+        // Shape 1: Pass A floor slab Shape::Mesh (exactly 1 box -> 3 visible faces = 12 vertices)
+        // Shapes 2..K: Pass B grid line segments
+        // Shape K: Pass C entities Shape::Mesh (bollards, shaft, modules, robots, drones, busbar)
+        let shapes = &full.shapes;
+        assert!(shapes.len() > 40, "Expected background + slab + grid lines + entity mesh");
+        match &shapes[1].shape {
+            Shape::Mesh(slab_mesh) => {
+                assert_eq!(
+                    slab_mesh.vertices.len(),
+                    12,
+                    "Pass A slab mesh must contain ONLY the 3 visible faces of the floor slab"
+                );
+            }
+            other => panic!("Expected Pass A slab Shape::Mesh at shapes[1], got {:?}", other),
+        }
+        let last_mesh_idx = shapes
+            .iter()
+            .rposition(|cs| matches!(cs.shape, Shape::Mesh(_)))
+            .expect("Expected Pass C entity mesh");
+        assert!(
+            last_mesh_idx > 2,
+            "Pass C entity mesh must follow Pass B grid lines"
+        );
+        if let Shape::Mesh(ent_mesh) = &shapes[last_mesh_idx].shape {
+            assert!(
+                ent_mesh.vertices.len() > 200,
+                "Expected full 3D entities (including back-half shaft & bollards) in Pass C"
+            );
+        }
+    }
+
+    #[test]
+    fn long_pipes_and_busbar_subdivide_into_short_segments() {
+        let mut parts = Vec::new();
+        push_subdivided_axis_box(
+            &mut parts,
+            Vec3::new(0.0, 0.14, 0.0),
+            Vec3::new(26.0 * CELL_PITCH * 0.8, 0.20, 0.22),
+            [217, 119, 6],
+            2.0,
+        );
+        assert!(parts.len() >= 25);
+        for p in &parts {
+            assert!(p.size.x <= 2.01 && p.size.z <= 2.01);
+        }
     }
 }
