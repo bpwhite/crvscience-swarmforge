@@ -4,7 +4,7 @@ version = "1.3.0"
 edition = "2021"
 authors = ["Bryan P. White <crvscience.com>"]
 description = "SwarmForge: 3D Isometric Automated Robotic Factory & Swarm Intelligence Simulation Game"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 eframe = { version = "0.31", features = ["wgpu"] }
