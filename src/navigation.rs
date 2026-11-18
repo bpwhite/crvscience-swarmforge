@@ -588,6 +588,13 @@ fn segment_hits_any_obstacle(
     false
 }
 
+pub fn apply_orthogonal_unstick(dir_x: f32, dir_z: f32, sign: f32) -> (f32, f32) {
+    (
+        -dir_z * sign * 2.2 + dir_x * 0.3,
+        dir_x * sign * 2.2 + dir_z * 0.3,
+    )
+}
+
 pub fn step_robot_with_collision(
     state: &mut GameState,
     r_idx: usize,
@@ -727,8 +734,7 @@ pub fn step_robot_with_collision(
                 } else {
                     -1.0
                 };
-                dir_x = -dir_z * sign * 2.2 + dir_x * 0.3;
-                dir_z = dir_x * sign * 2.2 + dir_z * 0.3;
+                (dir_x, dir_z) = apply_orthogonal_unstick(dir_x, dir_z, sign);
                 if entry.2 > 1.05 {
                     *entry = (rx, rz, 0.0);
                 }
@@ -907,5 +913,83 @@ mod tests {
             }
         }
         assert!(arrived, "Builder Bot failed to navigate around (0, 0)!");
+    }
+
+    #[test]
+    fn orthogonal_unstick_rotates_90_degrees_without_aliasing_for_all_headings() {
+        let norm_scale = (2.2_f32 * 2.2 + 0.3 * 0.3).sqrt();
+        let expected_dot = 0.3 / norm_scale;
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+
+        let headings = [
+            (1.0f32, 0.0f32),
+            (0.0, 1.0),
+            (-1.0, 0.0),
+            (0.0, -1.0),
+            (inv_sqrt2, inv_sqrt2),
+            (-inv_sqrt2, inv_sqrt2),
+        ];
+
+        for (dx, dz) in headings {
+            for sign in [1.0f32, -1.0f32] {
+                let (ux, uz) = apply_orthogonal_unstick(dx, dz, sign);
+                let len = ux.hypot(uz);
+                assert!((len - norm_scale).abs() < 1e-4, "magnitude mismatch for ({dx},{dz})");
+                let nx = ux / len;
+                let nz = uz / len;
+                let dot = dx * nx + dz * nz;
+                let cross = dx * nz - dz * nx;
+                assert!(
+                    (dot - expected_dot).abs() < 1e-5,
+                    "dot product mismatch for ({dx},{dz}) sign={sign}: got {dot}, expected {expected_dot}"
+                );
+                let expected_cross = sign * 2.2 / norm_scale;
+                assert!(
+                    (cross - expected_cross).abs() < 1e-5,
+                    "cross product mismatch for ({dx},{dz}) sign={sign}: got {cross}, expected {expected_cross}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stuck_robot_step_deflects_orthogonally_not_backward() {
+        let mut state = GameState::new_starter_factory();
+        state.modules.retain(|m| m.floor != FloorId::MainFloor);
+        state.robots.clear();
+        let bid = 99;
+        state.robots.push(Robot {
+            id: bid,
+            kind: RobotKind::BasicWorker,
+            floor: FloorId::MainFloor,
+            x: 0.0,
+            z: 0.0,
+            target_x: 0.0,
+            target_z: 4.8,
+            heading: std::f32::consts::FRAC_PI_2,
+            tier: 1,
+            energy: 1.0,
+            integrity: 1.0,
+            morale_boost_timer: 0.0,
+            task: RobotTask::Idle,
+            tasks_completed: 0,
+        });
+        state.tick_count = 0;
+        state.stuck_tracker.insert(bid, (0.0, 0.0, 0.60));
+
+        let arrived = step_robot_with_collision(&mut state, 0, 2.0, 0.05);
+        assert!(!arrived);
+        let bot = &state.robots[0];
+        assert!(
+            bot.z >= 0.0,
+            "Stuck robot must not reverse backward into -Z: z={}",
+            bot.z
+        );
+        assert!(
+            bot.x.abs() > bot.z.abs() * 5.0,
+            "Stuck robot should deflect strongly along X axis: x={}, z={}",
+            bot.x,
+            bot.z
+        );
     }
 }

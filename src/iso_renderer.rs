@@ -18,7 +18,7 @@
 use crate::model::{FloorId, GameState, Robot, RobotTask};
 use crate::models_3d::{build_module_parts, build_robot_parts, BoxPart};
 use crate::navigation::CELL_PITCH;
-use egui::{Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke};
+use egui::{Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 use glam::{Mat4, Quat, Vec3, Vec4};
 use std::sync::Arc;
 
@@ -26,6 +26,36 @@ use std::sync::Arc;
 pub enum FloorViewMode {
     Single(FloorId),
     AllFloorsCutaway,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitEntity {
+    Module(u32),
+    Robot(u32),
+}
+
+#[derive(Debug, Clone)]
+pub struct HitBox {
+    pub entity: HitEntity,
+    pub center: Pos2,
+    pub bounds: Rect,
+    pub depth: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScenePickResult {
+    pub entities: Vec<HitBox>,
+}
+
+pub fn pick_entity(hits: &[HitBox], pos: Pos2) -> Option<HitEntity> {
+    hits.iter()
+        .filter(|h| h.bounds.contains(pos))
+        .max_by(|a, b| {
+            a.depth
+                .partial_cmp(&b.depth)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|h| h.entity)
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +89,20 @@ struct ProjectedQuad {
 }
 
 impl IsoCamera {
+    pub fn active_focus_y(&self) -> f32 {
+        match self.view_mode {
+            FloorViewMode::Single(f) => f.world_y(),
+            FloorViewMode::AllFloorsCutaway => 2.8,
+        }
+    }
+
+    pub fn floor_render_y(&self, floor: FloorId) -> f32 {
+        match self.view_mode {
+            FloorViewMode::Single(_) => floor.world_y(),
+            FloorViewMode::AllFloorsCutaway => floor.world_y() * 1.28,
+        }
+    }
+
     fn view_matrix(&self, target_y: f32) -> Mat4 {
         let dist = 58.0;
         let cp = self.pitch.cos();
@@ -76,6 +120,31 @@ impl IsoCamera {
         let sx = center.x + self.pan_x + v.x * self.zoom;
         let sy = center.y + self.pan_y - v.y * self.zoom;
         (Pos2::new(sx, sy), v.z)
+    }
+
+    pub fn screen_to_floor_grid(
+        &self,
+        pos: Pos2,
+        rect: Rect,
+        focus_y: f32,
+        floor_y: f32,
+    ) -> Option<(i32, i32)> {
+        let zoom = self.zoom.max(1e-4);
+        let center = rect.center();
+        let vx = (pos.x - center.x - self.pan_x) / zoom;
+        let vy = -(pos.y - center.y - self.pan_y) / zoom;
+        let inv = self.view_matrix(focus_y).inverse();
+        let origin = (inv * Vec4::new(vx, vy, 0.0, 1.0)).truncate();
+        let dir = (inv * Vec4::new(0.0, 0.0, -1.0, 0.0)).truncate();
+        if dir.y.abs() < 1e-4 {
+            return None;
+        }
+        let t = (floor_y - origin.y) / dir.y;
+        let world = origin + dir * t;
+        Some((
+            (world.x / CELL_PITCH).round() as i32,
+            (world.z / CELL_PITCH).round() as i32,
+        ))
     }
 }
 
@@ -114,7 +183,7 @@ fn push_subdivided_axis_box(
     }
 }
 
-fn emit_parts_mesh(
+fn emit_parts_mesh_alpha(
     painter: &Painter,
     cam: &IsoCamera,
     view: &Mat4,
@@ -122,13 +191,14 @@ fn emit_parts_mesh(
     rect: Rect,
     focus_y: f32,
     parts: &[BoxPart],
+    alpha: u8,
 ) {
     if parts.is_empty() {
         return;
     }
     let mut quads: Vec<ProjectedQuad> = Vec::with_capacity(parts.len() * 3);
     for part in parts {
-        emit_oriented_box(&mut quads, cam, view, sun_dir, rect, focus_y, part);
+        emit_oriented_box(&mut quads, cam, view, sun_dir, rect, focus_y, part, alpha);
     }
     quads.sort_by(|a, b| {
         a.depth
@@ -149,21 +219,82 @@ fn emit_parts_mesh(
     painter.add(Shape::Mesh(Arc::new(mesh)));
 }
 
+fn emit_parts_mesh(
+    painter: &Painter,
+    cam: &IsoCamera,
+    view: &Mat4,
+    sun_dir: Vec3,
+    rect: Rect,
+    focus_y: f32,
+    parts: &[BoxPart],
+) {
+    emit_parts_mesh_alpha(painter, cam, view, sun_dir, rect, focus_y, parts, 255);
+}
+
+fn project_entity_hitbox(
+    cam: &IsoCamera,
+    rect: Rect,
+    focus_y: f32,
+    center_w: Vec3,
+    half_ext: Vec3,
+    min_size: f32,
+    entity: HitEntity,
+) -> HitBox {
+    let (center, depth) = cam.project(center_w, rect, focus_y);
+    let mut min_x = center.x;
+    let mut max_x = center.x;
+    let mut min_y = center.y;
+    let mut max_y = center.y;
+    for sx in [-1.0f32, 1.0f32] {
+        for sy in [-1.0f32, 1.0f32] {
+            for sz in [-1.0f32, 1.0f32] {
+                let corner = center_w
+                    + Vec3::new(sx * half_ext.x, sy * half_ext.y, sz * half_ext.z);
+                let (sp, _) = cam.project(corner, rect, focus_y);
+                min_x = min_x.min(sp.x);
+                max_x = max_x.max(sp.x);
+                min_y = min_y.min(sp.y);
+                max_y = max_y.max(sp.y);
+            }
+        }
+    }
+    let mut bounds = Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y));
+    let half_min = min_size * 0.5;
+    let min_rect = Rect::from_center_size(center, Vec2::splat(half_min * 2.0));
+    bounds = bounds.union(min_rect);
+    HitBox {
+        entity,
+        center,
+        bounds,
+        depth,
+    }
+}
+
 pub fn render_isometric_factory(
     painter: &Painter,
     rect: Rect,
     state: &GameState,
     cam: &IsoCamera,
 ) {
+    let _ = render_isometric_factory_interactive(painter, rect, state, cam, None, None, None);
+}
+
+pub fn render_isometric_factory_interactive(
+    painter: &Painter,
+    rect: Rect,
+    state: &GameState,
+    cam: &IsoCamera,
+    selected: Option<HitEntity>,
+    hovered: Option<HitEntity>,
+    ghost_bay: Option<(FloorId, i32, i32, bool)>,
+) -> ScenePickResult {
     painter.rect_filled(rect, 0.0, Color32::from_rgb(10, 14, 22));
 
-    let focus_y = match cam.view_mode {
-        FloorViewMode::Single(f) => f.world_y(),
-        FloorViewMode::AllFloorsCutaway => 2.8,
-    };
+    let focus_y = cam.active_focus_y();
     let view = cam.view_matrix(focus_y);
     let sun_dir = Vec3::new(0.48, 0.76, 0.43).normalize();
     let time_s = state.elapsed_secs as f32;
+    let mut pick_result = ScenePickResult::default();
 
     for floor in FloorId::ALL {
         if let FloorViewMode::Single(sel) = cam.view_mode {
@@ -171,16 +302,9 @@ pub fn render_isometric_factory(
                 continue;
             }
         }
-        let fy = match cam.view_mode {
-            FloorViewMode::Single(_) => floor.world_y(),
-            FloorViewMode::AllFloorsCutaway => floor.world_y() * 1.28,
-        };
+        let fy = cam.floor_render_y(floor);
 
-        let half_cells = match floor {
-            FloorId::MainFloor => state.main_floor_half_extent,
-            FloorId::Administration => 4,
-            _ => 5,
-        };
+        let half_cells = crate::floors::floor_half_extent(state, floor);
         let half = half_cells as f32 * CELL_PITCH + 1.0;
 
         let slab_rgb = match floor {
@@ -189,6 +313,16 @@ pub fn render_isometric_factory(
             FloorId::TechResearch => [27, 46, 60],
             FloorId::Administration => [40, 38, 54],
         };
+        let slab_alpha = match cam.view_mode {
+            FloorViewMode::Single(_) => 255,
+            FloorViewMode::AllFloorsCutaway => {
+                if floor == FloorId::Basement {
+                    215
+                } else {
+                    96
+                }
+            }
+        };
 
         // Pass A: Floor slab Shape::Mesh only (guaranteed behind Pass B & Pass C on this floor).
         let slab_part = [BoxPart::axis_aligned(
@@ -196,10 +330,27 @@ pub fn render_isometric_factory(
             Vec3::new(half * 2.0, 0.36, half * 2.0),
             slab_rgb,
         )];
-        emit_parts_mesh(painter, cam, &view, sun_dir, rect, focus_y, &slab_part);
+        emit_parts_mesh_alpha(
+            painter,
+            cam,
+            &view,
+            sun_dir,
+            rect,
+            focus_y,
+            &slab_part,
+            slab_alpha,
+        );
 
         // Pass B: Floor tile grid lines & pheromone trails (above slab, strictly below entities).
-        let grid_stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(90, 125, 160, 42));
+        let grid_alpha = if matches!(cam.view_mode, FloorViewMode::AllFloorsCutaway) {
+            64
+        } else {
+            42
+        };
+        let grid_stroke = Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(90, 125, 160, grid_alpha),
+        );
         let min_c = (-half_cells as f32 - 0.5) * CELL_PITCH;
         let max_c = (half_cells as f32 - 0.5) * CELL_PITCH;
         for i in -half_cells..=half_cells {
@@ -210,6 +361,50 @@ pub fn render_isometric_factory(
             let (b1, _) = cam.project(Vec3::new(min_c, fy + 0.01, coord), rect, focus_y);
             let (b2, _) = cam.project(Vec3::new(max_c, fy + 0.01, coord), rect, focus_y);
             painter.line_segment([b1, b2], grid_stroke);
+        }
+
+        if matches!(cam.view_mode, FloorViewMode::AllFloorsCutaway) {
+            let cx = -0.5 * CELL_PITCH;
+            let cz = -0.5 * CELL_PITCH;
+            let corners = [
+                cam.project(Vec3::new(cx - half, fy + 0.02, cz - half), rect, focus_y).0,
+                cam.project(Vec3::new(cx + half, fy + 0.02, cz - half), rect, focus_y).0,
+                cam.project(Vec3::new(cx + half, fy + 0.02, cz + half), rect, focus_y).0,
+                cam.project(Vec3::new(cx - half, fy + 0.02, cz + half), rect, focus_y).0,
+            ];
+            let outline = Stroke::new(
+                1.3_f32,
+                Color32::from_rgba_unmultiplied(120, 185, 240, 155),
+            );
+            for k in 0..4 {
+                painter.line_segment([corners[k], corners[(k + 1) % 4]], outline);
+            }
+        }
+
+        if let Some((gf, gx, gz, valid)) = ghost_bay {
+            if gf == floor {
+                let wx = gx as f32 * CELL_PITCH;
+                let wz = gz as f32 * CELL_PITCH;
+                let e = 0.95f32;
+                let pts = vec![
+                    cam.project(Vec3::new(wx - e, fy + 0.04, wz - e), rect, focus_y).0,
+                    cam.project(Vec3::new(wx + e, fy + 0.04, wz - e), rect, focus_y).0,
+                    cam.project(Vec3::new(wx + e, fy + 0.04, wz + e), rect, focus_y).0,
+                    cam.project(Vec3::new(wx - e, fy + 0.04, wz + e), rect, focus_y).0,
+                ];
+                let (fill, border) = if valid {
+                    (
+                        Color32::from_rgba_unmultiplied(50, 225, 170, 75),
+                        Color32::from_rgb(80, 245, 190),
+                    )
+                } else {
+                    (
+                        Color32::from_rgba_unmultiplied(240, 75, 75, 75),
+                        Color32::from_rgb(255, 110, 100),
+                    )
+                };
+                painter.add(Shape::convex_polygon(pts, fill, Stroke::new(1.8_f32, border)));
+            }
         }
 
         if floor == FloorId::MainFloor {
@@ -410,7 +605,7 @@ pub fn render_isometric_factory(
             let (dp, _) = cam.project(Vec3::new(d.x, fy + 2.45, d.z), rect, focus_y);
             badges.push((
                 dp,
-                format!("⚠ {}", d.kind.label()),
+                format!("[!] {}", d.kind.label()),
                 Color32::from_rgb(255, 110, 75),
             ));
 
@@ -440,6 +635,34 @@ pub fn render_isometric_factory(
 
         for m in state.modules.iter().filter(|m| m.floor == floor) {
             build_module_parts(&mut parts, m, fy, time_s);
+            let ent = HitEntity::Module(m.id);
+            pick_result.entities.push(project_entity_hitbox(
+                cam,
+                rect,
+                focus_y,
+                Vec3::new(m.visual_x, fy + 0.72, m.visual_z),
+                Vec3::new(0.85, 0.72, 0.85),
+                22.0,
+                ent,
+            ));
+            if selected == Some(ent) || hovered == Some(ent) {
+                let col = if selected == Some(ent) {
+                    Color32::from_rgb(255, 220, 60)
+                } else {
+                    Color32::from_rgb(90, 225, 255)
+                };
+                let e = 0.96f32;
+                let ring = [
+                    cam.project(Vec3::new(m.visual_x - e, fy + 0.14, m.visual_z - e), rect, focus_y).0,
+                    cam.project(Vec3::new(m.visual_x + e, fy + 0.14, m.visual_z - e), rect, focus_y).0,
+                    cam.project(Vec3::new(m.visual_x + e, fy + 0.14, m.visual_z + e), rect, focus_y).0,
+                    cam.project(Vec3::new(m.visual_x - e, fy + 0.14, m.visual_z + e), rect, focus_y).0,
+                ];
+                let stroke = Stroke::new(if selected == Some(ent) { 2.4_f32 } else { 1.8_f32 }, col);
+                for k in 0..4 {
+                    entity_overlays.push((ring[k], ring[(k + 1) % 4], stroke));
+                }
+            }
             if m.being_relocated {
                 let (bp, _) = cam.project(
                     Vec3::new(m.visual_x, fy + 2.15, m.visual_z),
@@ -474,6 +697,40 @@ pub fn render_isometric_factory(
 
         for r in floor_bots {
             build_robot_parts(&mut parts, r, fy, time_s);
+            let ent = HitEntity::Robot(r.id);
+            let bot_y = if r.kind == crate::model::RobotKind::MotivationDrone {
+                fy + 2.55
+            } else {
+                fy + 0.45
+            };
+            let hb = project_entity_hitbox(
+                cam,
+                rect,
+                focus_y,
+                Vec3::new(r.x, bot_y, r.z),
+                Vec3::new(0.45, 0.45, 0.45),
+                20.0,
+                ent,
+            );
+            if selected == Some(ent) || hovered == Some(ent) {
+                let col = if selected == Some(ent) {
+                    Color32::from_rgb(255, 220, 60)
+                } else {
+                    Color32::from_rgb(90, 225, 255)
+                };
+                let e = 0.56f32;
+                let ring = [
+                    cam.project(Vec3::new(r.x - e, fy + 0.14, r.z - e), rect, focus_y).0,
+                    cam.project(Vec3::new(r.x + e, fy + 0.14, r.z - e), rect, focus_y).0,
+                    cam.project(Vec3::new(r.x + e, fy + 0.14, r.z + e), rect, focus_y).0,
+                    cam.project(Vec3::new(r.x - e, fy + 0.14, r.z + e), rect, focus_y).0,
+                ];
+                let stroke = Stroke::new(if selected == Some(ent) { 2.2_f32 } else { 1.6_f32 }, col);
+                for k in 0..4 {
+                    entity_overlays.push((ring[k], ring[(k + 1) % 4], stroke));
+                }
+            }
+            pick_result.entities.push(hb);
             if let RobotTask::RelocatingModule {
                 dest_gx, dest_gz, ..
             } = r.task
@@ -510,6 +767,8 @@ pub fn render_isometric_factory(
             }
         }
     }
+
+    pick_result
 }
 
 fn emit_oriented_box(
@@ -520,6 +779,7 @@ fn emit_oriented_box(
     rect: Rect,
     focus_y: f32,
     part: &BoxPart,
+    alpha: u8,
 ) {
     let h = part.size * 0.5;
     let local_corners = [
@@ -568,10 +828,15 @@ fn emit_oriented_box(
         let r = ((part.rgb[0] as f32) * shade).clamp(0.0, 255.0) as u8;
         let g = ((part.rgb[1] as f32) * shade).clamp(0.0, 255.0) as u8;
         let b = ((part.rgb[2] as f32) * shade).clamp(0.0, 255.0) as u8;
+        let color = if alpha == 255 {
+            Color32::from_rgb(r, g, b)
+        } else {
+            Color32::from_rgba_unmultiplied(r, g, b, alpha)
+        };
         quads.push(ProjectedQuad {
             pts,
             depth: z_sum * 0.25,
-            color: Color32::from_rgb(r, g, b),
+            color,
         });
     }
 }
@@ -644,5 +909,109 @@ mod tests {
         for p in &parts {
             assert!(p.size.x <= 2.01 && p.size.z <= 2.01);
         }
+    }
+
+    #[test]
+    fn cutaway_mode_renders_translucent_upper_slabs_and_picking_hits_entities() {
+        let state = GameState::new_starter_factory();
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+
+        // 1. Check AllFloorsCutaway produces translucent slabs (alpha < 255)
+        let mut cam_cut = IsoCamera::default();
+        cam_cut.view_mode = FloorViewMode::AllFloorsCutaway;
+        let full_cut = ctx.run(egui::RawInput::default(), |c| {
+            let painter = Painter::new(
+                c.clone(),
+                LayerId::new(Order::Middle, egui::Id::new("cut")),
+                rect,
+            );
+            let _ = render_isometric_factory_interactive(
+                &painter,
+                rect,
+                &state,
+                &cam_cut,
+                None,
+                None,
+                None,
+            );
+        });
+        let slab_meshes: Vec<&Mesh> = full_cut
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                Shape::Mesh(m) if m.vertices.len() == 12 => Some(m.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slab_meshes.len(), 4, "Expected 4 floor slab meshes in cutaway");
+        assert!(
+            slab_meshes[1]
+                .vertices
+                .iter()
+                .all(|v| v.color.a() < 255 && v.color.a() > 0),
+            "Expected upper floor slab in AllFloorsCutaway to be translucent"
+        );
+
+        // 2. Check Single-mode picking & screen_to_floor_grid roundtrip
+        let mut cam_single = IsoCamera::default();
+        cam_single.view_mode = FloorViewMode::Single(FloorId::MainFloor);
+        let mut pick_res = ScenePickResult::default();
+        let _ = ctx.run(egui::RawInput::default(), |c| {
+            let painter = Painter::new(
+                c.clone(),
+                LayerId::new(Order::Middle, egui::Id::new("single")),
+                rect,
+            );
+            pick_res = render_isometric_factory_interactive(
+                &painter,
+                rect,
+                &state,
+                &cam_single,
+                None,
+                None,
+                None,
+            );
+        });
+        let starter_bot = &state.robots[0];
+        let (bot_pos, _) = cam_single.project(
+            Vec3::new(starter_bot.x, FloorId::MainFloor.world_y() + 0.45, starter_bot.z),
+            rect,
+            cam_single.active_focus_y(),
+        );
+        assert_eq!(
+            pick_entity(&pick_res.entities, bot_pos),
+            Some(HitEntity::Robot(starter_bot.id))
+        );
+
+        let proto = state
+            .modules
+            .iter()
+            .find(|m| m.kind == crate::model::ModuleKind::ProtoBench)
+            .expect("starter ProtoBench");
+        let (mod_pos, _) = cam_single.project(
+            Vec3::new(proto.visual_x, FloorId::MainFloor.world_y() + 0.72, proto.visual_z),
+            rect,
+            cam_single.active_focus_y(),
+        );
+        assert_eq!(
+            pick_entity(&pick_res.entities, mod_pos),
+            Some(HitEntity::Module(proto.id))
+        );
+
+        let (grid_screen, _) = cam_single.project(
+            Vec3::new(2.0 * CELL_PITCH, FloorId::MainFloor.world_y(), -1.0 * CELL_PITCH),
+            rect,
+            cam_single.active_focus_y(),
+        );
+        assert_eq!(
+            cam_single.screen_to_floor_grid(
+                grid_screen,
+                rect,
+                cam_single.active_focus_y(),
+                cam_single.floor_render_y(FloorId::MainFloor)
+            ),
+            Some((2, -1))
+        );
     }
 }

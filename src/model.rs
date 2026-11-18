@@ -659,3 +659,33 @@ impl GameState {
         self.unlocked_techs.iter().any(|t| t == id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floor_titles_contain_single_code_prefix_and_event_log_caps_at_40() {
+        for floor in FloorId::ALL {
+            let code = floor.code();
+            let title = floor.title();
+            assert!(
+                title.starts_with(&format!("{code}: ")),
+                "Expected floor title '{title}' to start with '{code}: '"
+            );
+            assert_eq!(
+                title.matches(code).count(),
+                1,
+                "Floor title '{title}' should contain '{code}' only once"
+            );
+        }
+
+        let mut state = GameState::new_starter_factory();
+        for i in 0..55 {
+            state.push_log(format!("Log entry {i}"));
+        }
+        assert_eq!(state.event_log.len(), 40);
+        assert_eq!(state.event_log.first().map(String::as_str), Some("Log entry 15"));
+        assert_eq!(state.event_log.last().map(String::as_str), Some("Log entry 54"));
+    }
+}

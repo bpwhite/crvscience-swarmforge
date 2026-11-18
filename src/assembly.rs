@@ -384,7 +384,7 @@ pub fn complete_deliveries(state: &mut GameState, units: u32) {
 
     for (title, bc, brp) in newly_completed {
         state.push_log(format!(
-            "Contract Complete: {title} (+₡{bc:.0}, +{brp:.0} RP)!"
+            "Contract Complete: {title} (+{bc:.0} Cr, +{brp:.0} RP)!"
         ));
     }
 }

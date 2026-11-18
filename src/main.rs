@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -22,6 +23,16 @@ use swarmforge::assembly::tick_factory;
 use swarmforge::model::GameState;
 use swarmforge::navigation::enforce_spacing_and_migrate;
 use swarmforge::persistence::{export_json_file, import_json_file};
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: Attaches stdout/stderr to the invoking parent console when CLI flags are passed.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,6 +63,11 @@ struct Cli {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    if std::env::args_os().len() > 1 {
+        attach_parent_console();
+    }
+
     let cli = Cli::parse();
 
     let mut state = if let Some(ref json_in) = cli.import_json {
@@ -67,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tick_factory(&mut state, 0.1);
         }
         println!(
-            "SwarmForge v1.3.0 Headless Summary ({ticks} ticks / {:.1}s): Credits=₡{:.1} | RP={:.1} | Shipped={} | Pathing η={:.1}% | F1={}x{}",
+            "SwarmForge v1.3.0 Headless Summary ({ticks} ticks / {:.1}s): Credits={:.1} Cr | RP={:.1} | Shipped={} | Pathing={:.1}% | F1={}x{}",
             state.elapsed_secs,
             state.credits,
             state.research_points,
@@ -95,9 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SwarmForge v1.3.0 — 3D Isometric Robotic Factory")
+            .with_title("SwarmForge v1.3.0 - 3D Isometric Robotic Factory")
             .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([1024.0, 680.0]),
+            .with_min_inner_size([1024.0, 680.0])
+            .with_icon(std::sync::Arc::new(swarmforge::icon::window_icon_data())),
         ..Default::default()
     };
 

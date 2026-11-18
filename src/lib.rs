@@ -26,6 +26,7 @@ pub mod assembly;
 pub mod builder_ai;
 pub mod disasters;
 pub mod floors;
+pub mod icon;
 pub mod iso_renderer;
 pub mod model;
 pub mod models_3d;

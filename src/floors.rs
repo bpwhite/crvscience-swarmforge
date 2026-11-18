@@ -20,10 +20,20 @@ use crate::model::{
     DeliveryContract, FactoryModule, FloorId, GameState, ModuleKind, Robot, RobotKind, RobotTask,
     PRODUCT_CATALOG,
 };
-use crate::navigation::{module_dock_point, step_robot_with_collision};
+use crate::navigation::{
+    has_module_clearance, module_dock_point, step_robot_with_collision, MIN_MODULE_CHEBYSHEV,
+};
 use crate::swarm_tech::compute_multipliers;
 
 pub const MAX_MAIN_FLOOR_HALF_EXTENT: i32 = 13; // Up to 26x26 Megafactory slab!
+
+pub fn floor_half_extent(state: &GameState, floor: FloorId) -> i32 {
+    match floor {
+        FloorId::MainFloor => state.main_floor_half_extent,
+        FloorId::Administration => 4,
+        FloorId::Basement | FloorId::TechResearch => 5,
+    }
+}
 
 pub fn tick_support_floors(state: &mut GameState, dt: f32) {
     let mult = compute_multipliers(state);
@@ -273,14 +283,14 @@ pub fn purchase_robot(state: &mut GameState, kind: RobotKind) -> Result<u32, Str
     let count = state.robots.iter().filter(|r| r.kind == kind).count() as u32;
     let cost = robot_current_cost(kind, count);
     if state.credits < cost {
-        return Err(format!("Need ₡{cost:.0} credits."));
+        return Err(format!("Need {cost:.0} Cr credits."));
     }
     state.credits -= cost;
     let id = state.alloc_id();
     let floor = kind.home_floor();
     let angle = (id as f32) * 1.15;
     let rad = 1.6 + ((id % 4) as f32) * 0.65;
-    let half = if floor == FloorId::MainFloor { state.main_floor_half_extent } else { 4 };
+    let half = floor_half_extent(state, floor);
     let (sx, sz) = crate::navigation::find_safe_open_point(
         &state.modules, floor, half, angle.cos() * rad, angle.sin() * rad, 0.54
     );
@@ -314,20 +324,65 @@ pub fn robot_current_cost(kind: RobotKind, existing_of_kind: u32) -> f64 {
     kind.base_cost() * 1.18_f64.powi(existing_of_kind as i32)
 }
 
-pub fn purchase_module(state: &mut GameState, kind: ModuleKind) -> Result<u32, String> {
+pub fn can_place_module_at(
+    state: &GameState,
+    floor: FloorId,
+    gx: i32,
+    gz: i32,
+) -> Result<(), String> {
+    let half = floor_half_extent(state, floor);
+    if gx < -half || gx >= half || gz < -half || gz >= half {
+        return Err(format!(
+            "Bay ({gx}, {gz}) is outside {} bounds [{}, {}).",
+            floor.code(),
+            -half,
+            half
+        ));
+    }
+    if !has_module_clearance(&state.modules, floor, gx, gz, None) {
+        return Err(format!(
+            "Bay ({gx}, {gz}) on {} violates 2-bay module or shaft clearance.",
+            floor.code()
+        ));
+    }
+    let reserved = state.robots.iter().any(|r| match r.task {
+        RobotTask::MovingToRelocate {
+            dest_gx, dest_gz, ..
+        }
+        | RobotTask::RelocatingModule {
+            dest_gx, dest_gz, ..
+        } => {
+            r.floor == floor
+                && (dest_gx - gx).abs().max((dest_gz - gz).abs()) < MIN_MODULE_CHEBYSHEV
+        }
+        _ => false,
+    });
+    if reserved {
+        return Err(format!(
+            "Bay ({gx}, {gz}) on {} is reserved by an active Builder relocation.",
+            floor.code()
+        ));
+    }
+    Ok(())
+}
+
+pub fn purchase_module_at(
+    state: &mut GameState,
+    kind: ModuleKind,
+    gx: i32,
+    gz: i32,
+) -> Result<u32, String> {
+    if kind == ModuleKind::VerticalFreightLift {
+        return Err("Vertical Freight & Utility Shaft is a fixed core structure.".to_string());
+    }
+    let floor = kind.floor();
+    can_place_module_at(state, floor, gx, gz)?;
+
     let count = state.modules.iter().filter(|m| m.kind == kind).count() as u32;
     let cost = module_current_cost(kind, count);
     if state.credits < cost {
-        return Err(format!("Need ₡{cost:.0} credits."));
+        return Err(format!("Need {cost:.0} Cr credits."));
     }
-    let floor = kind.floor();
-    let Some((gx, gz)) = find_procedural_bay_slot(state, floor) else {
-        return Err(if floor == FloorId::MainFloor {
-            "Minimum 2-bay module clearance reached on F1 — click '+ Expand F1 Floor'!".to_string()
-        } else {
-            format!("All spaced bays occupied on {}!", floor.code())
-        });
-    };
 
     state.credits -= cost;
     let id = state.alloc_id();
@@ -339,6 +394,24 @@ pub fn purchase_module(state: &mut GameState, kind: ModuleKind) -> Result<u32, S
         floor.code()
     ));
     Ok(id)
+}
+
+pub fn purchase_module(state: &mut GameState, kind: ModuleKind) -> Result<u32, String> {
+    let count = state.modules.iter().filter(|m| m.kind == kind).count() as u32;
+    let cost = module_current_cost(kind, count);
+    if state.credits < cost {
+        return Err(format!("Need {cost:.0} Cr credits."));
+    }
+    let floor = kind.floor();
+    let Some((gx, gz)) = find_procedural_bay_slot(state, floor) else {
+        return Err(if floor == FloorId::MainFloor {
+            "Minimum 2-bay module clearance reached on F1 - click '+ Expand F1 Floor'!".to_string()
+        } else {
+            format!("All spaced bays occupied on {}!", floor.code())
+        });
+    };
+
+    purchase_module_at(state, kind, gx, gz)
 }
 
 pub fn module_current_cost(kind: ModuleKind, existing_of_kind: u32) -> f64 {
@@ -364,7 +437,7 @@ pub fn expand_main_floor(state: &mut GameState) -> Result<(), String> {
         return Err("Main Factory Floor already at maximum 26x26 Megafactory span.".to_string());
     };
     if state.credits < cost {
-        return Err(format!("Need ₡{cost:.0} credits to expand Floor 1."));
+        return Err(format!("Need {cost:.0} Cr credits to expand Floor 1."));
     }
     state.credits -= cost;
     state.main_floor_half_extent += 1;
@@ -373,4 +446,59 @@ pub fn expand_main_floor(state: &mut GameState) -> Result<(), String> {
         "Expanded Floor 1 Main Slab to {span}x{span} bays!"
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_module_placement_enforces_bounds_shaft_and_chebyshev_clearance() {
+        let mut state = GameState::new_starter_factory();
+        state.credits = 2000.0;
+
+        // Valid open bay on F1 (far from (-3,-3), (3,-3), (3,3))
+        let id = purchase_module_at(&mut state, ModuleKind::FabricationCell, -1, 2)
+            .expect("valid manual placement at (-1, 2)");
+        assert!(state.modules.iter().any(|m| m.id == id && m.gx == -1 && m.gz == 2));
+
+        // Out-of-bounds on F1 (half = 5 -> valid range -5..5)
+        assert!(purchase_module_at(&mut state, ModuleKind::ProtoBench, 5, 0).is_err());
+        assert!(purchase_module_at(&mut state, ModuleKind::ProtoBench, -6, 0).is_err());
+
+        // Chebyshev < 2 neighbor of (-1, 2)
+        assert!(purchase_module_at(&mut state, ModuleKind::ProtoBench, 0, 2).is_err());
+        assert!(purchase_module_at(&mut state, ModuleKind::ProtoBench, -2, 1).is_err());
+
+        // Non-MainFloor shaft proximity (-3, -3) and adjacent (-2, -2) on Basement
+        assert!(purchase_module_at(&mut state, ModuleKind::StorageSilo, -3, -3).is_err());
+        assert!(purchase_module_at(&mut state, ModuleKind::StorageSilo, -2, -2).is_err());
+
+        // Fixed lift rejected
+        assert!(purchase_module_at(&mut state, ModuleKind::VerticalFreightLift, 0, 0).is_err());
+
+        // Insufficient credits leaves state untouched
+        state.credits = 5.0;
+        let mod_count_before = state.modules.len();
+        assert!(purchase_module_at(&mut state, ModuleKind::ProtoBench, -4, 4).is_err());
+        assert_eq!(state.modules.len(), mod_count_before);
+        assert!((state.credits - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn support_floors_update_power_and_coolant_metrics() {
+        let mut state = GameState::new_starter_factory();
+        let initial_supply = state.power_supply_kw;
+        let initial_psi = state.coolant_pressure_psi;
+        state.credits = 5000.0;
+        purchase_module_at(&mut state, ModuleKind::PowerSubstation, -4, 4).expect("substation");
+        purchase_module_at(&mut state, ModuleKind::PlumbingChiller, 4, -4).expect("chiller");
+
+        for _ in 0..20 {
+            tick_support_floors(&mut state, 0.1);
+        }
+        assert!(state.power_supply_kw > initial_supply + 20.0);
+        assert!(state.power_demand_kw > 0.0);
+        assert!(state.coolant_pressure_psi > initial_psi);
+    }
 }

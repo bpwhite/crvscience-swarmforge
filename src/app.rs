@@ -18,13 +18,18 @@
 use crate::assembly::{complete_deliveries, tick_factory};
 use crate::builder_ai::count_open_spaced_slots;
 use crate::floors::{
-    expand_main_floor, expansion_cost, module_current_cost, purchase_module, purchase_robot,
-    robot_current_cost,
+    can_place_module_at, expand_main_floor, expansion_cost, floor_half_extent, module_current_cost,
+    purchase_module, purchase_module_at, purchase_robot, robot_current_cost,
 };
-use crate::iso_renderer::{render_isometric_factory, FloorViewMode, IsoCamera};
-use crate::model::{FloorId, GameState, ModuleKind, RobotKind, PRODUCT_CATALOG};
+use crate::iso_renderer::{
+    pick_entity, render_isometric_factory_interactive, FloorViewMode, HitBox, HitEntity, IsoCamera,
+};
+use crate::model::{
+    ActiveDisaster, DisasterKind, FloorId, GameState, ModuleKind, RobotKind, RobotTask,
+    PRODUCT_CATALOG,
+};
 use crate::navigation::enforce_spacing_and_migrate;
-use crate::persistence::{export_json_file, import_json_file, SaveStore};
+use crate::persistence::{export_json_file, import_json_file, SaveSlotSummary, SaveStore};
 use crate::swarm_tech::{can_unlock_tech, unlock_tech, TechBranch, TECH_TREE};
 use egui::{Color32, Context, RichText, ScrollArea, Sense};
 use std::path::PathBuf;
@@ -47,16 +52,38 @@ pub struct SwarmForgeApp {
     paused: bool,
     last_frame: Instant,
     save_store: Option<SaveStore>,
+    save_store_error: Option<String>,
+    slots_cache: Vec<SaveSlotSummary>,
     slot_input: String,
     json_path_input: String,
     status_banner: String,
+    persistence_msg: Option<(bool, String)>,
+    show_about: bool,
+    event_log_expanded: bool,
+    last_hits: Vec<HitBox>,
+    selected_entity: Option<HitEntity>,
+    hovered_entity: Option<HitEntity>,
+    placement_mode: Option<ModuleKind>,
+    manual_gx: i32,
+    manual_gz: i32,
 }
 
 impl SwarmForgeApp {
     pub fn new(mut state: GameState, db_path: PathBuf) -> Self {
         enforce_spacing_and_migrate(&mut state);
-        let save_store = SaveStore::open(&db_path).ok();
-        Self {
+        let (save_store, save_store_error, status_banner) = match SaveStore::open(&db_path) {
+            Ok(store) => (
+                Some(store),
+                None,
+                "Ready - Spacious 2-bay clearance & solid robot collision active.".to_string(),
+            ),
+            Err(e) => (
+                None,
+                Some(e.clone()),
+                format!("SQLite unavailable: {e}"),
+            ),
+        };
+        let mut app = Self {
             state,
             camera: IsoCamera::default(),
             tab: SidebarTab::Robots,
@@ -64,10 +91,23 @@ impl SwarmForgeApp {
             paused: false,
             last_frame: Instant::now(),
             save_store,
+            save_store_error,
+            slots_cache: Vec::new(),
             slot_input: "slot_1".to_string(),
             json_path_input: "swarmforge_save.json".to_string(),
-            status_banner: "Ready — Spacious 2-bay clearance & solid robot collision active.".to_string(),
-        }
+            status_banner,
+            persistence_msg: None,
+            show_about: false,
+            event_log_expanded: false,
+            last_hits: Vec::new(),
+            selected_entity: None,
+            hovered_entity: None,
+            placement_mode: None,
+            manual_gx: 0,
+            manual_gz: 0,
+        };
+        app.refresh_slots();
+        app
     }
 
     pub fn new_headless(mut state: GameState) -> Self {
@@ -80,9 +120,122 @@ impl SwarmForgeApp {
             paused: true,
             last_frame: Instant::now(),
             save_store: None,
+            save_store_error: None,
+            slots_cache: Vec::new(),
             slot_input: "slot_1".to_string(),
             json_path_input: "swarmforge_save.json".to_string(),
-            status_banner: "Ready — Spacious 2-bay clearance & solid robot collision active.".to_string(),
+            status_banner: "Ready - Spacious 2-bay clearance & solid robot collision active."
+                .to_string(),
+            persistence_msg: None,
+            show_about: false,
+            event_log_expanded: false,
+            last_hits: Vec::new(),
+            selected_entity: None,
+            hovered_entity: None,
+            placement_mode: None,
+            manual_gx: 0,
+            manual_gz: 0,
+        }
+    }
+
+    pub fn open_about(&mut self, open: bool) {
+        self.show_about = open;
+    }
+
+    pub fn set_event_log_expanded(&mut self, expanded: bool) {
+        self.event_log_expanded = expanded;
+    }
+
+    fn set_status(&mut self, ok: bool, msg: String) {
+        self.status_banner = msg.clone();
+        self.persistence_msg = Some((ok, msg));
+    }
+
+    fn refresh_slots(&mut self) {
+        if let Some(store) = &self.save_store {
+            match store.list_slots() {
+                Ok(slots) => self.slots_cache = slots,
+                Err(e) => self.set_status(false, format!("Failed to list SQLite slots: {e}")),
+            }
+        } else {
+            self.slots_cache.clear();
+        }
+    }
+
+    fn save_slot_by_name(&mut self, slot_name: &str) {
+        let slot = slot_name.trim().to_string();
+        let Some(store) = &self.save_store else {
+            let err = self
+                .save_store_error
+                .clone()
+                .unwrap_or_else(|| "SQLite save store is unavailable.".to_string());
+            self.set_status(false, err);
+            return;
+        };
+        match store.save_slot(&slot, &self.state) {
+            Ok(()) => {
+                let msg = format!("Saved slot '{slot}'.");
+                self.state.push_log(msg.clone());
+                self.set_status(true, msg);
+                self.refresh_slots();
+            }
+            Err(e) => {
+                self.state.push_log(e.clone());
+                self.set_status(false, e);
+            }
+        }
+    }
+
+    fn load_slot_by_name(&mut self, slot_name: &str) {
+        let slot = slot_name.trim().to_string();
+        let Some(store) = &self.save_store else {
+            let err = self
+                .save_store_error
+                .clone()
+                .unwrap_or_else(|| "SQLite save store is unavailable.".to_string());
+            self.set_status(false, err);
+            return;
+        };
+        match store.load_slot(&slot) {
+            Ok(mut loaded) => {
+                enforce_spacing_and_migrate(&mut loaded);
+                self.state = loaded;
+                self.selected_entity = None;
+                self.hovered_entity = None;
+                self.placement_mode = None;
+                self.slot_input = slot.clone();
+                let msg = format!("Loaded slot '{slot}'.");
+                self.state.push_log(msg.clone());
+                self.set_status(true, msg);
+            }
+            Err(e) => {
+                self.state.push_log(e.clone());
+                self.set_status(false, e);
+            }
+        }
+    }
+
+    fn delete_slot_by_name(&mut self, slot_name: &str) {
+        let slot = slot_name.trim().to_string();
+        let Some(store) = &self.save_store else {
+            let err = self
+                .save_store_error
+                .clone()
+                .unwrap_or_else(|| "SQLite save store is unavailable.".to_string());
+            self.set_status(false, err);
+            return;
+        };
+        match store.delete_slot(&slot) {
+            Ok(()) => {
+                let msg = format!("Deleted slot '{slot}'.");
+                self.state.push_log(msg.clone());
+                self.set_status(true, msg);
+                self.refresh_slots();
+            }
+            Err(e) => {
+                self.state.push_log(e.clone());
+                self.set_status(false, e);
+            }
         }
     }
 }
@@ -129,12 +282,16 @@ impl SwarmForgeApp {
             if i.key_pressed(egui::Key::E) {
                 self.camera.yaw += std::f32::consts::FRAC_PI_2;
             }
+            if i.key_pressed(egui::Key::Escape) {
+                self.placement_mode = None;
+            }
         });
 
         self.draw_top_hud(ctx);
         self.draw_bottom_log(ctx);
         self.draw_left_command_dock(ctx);
         self.draw_central_viewport(ctx);
+        self.draw_about_window(ctx);
 
         ctx.request_repaint();
     }
@@ -151,7 +308,7 @@ impl SwarmForgeApp {
                 );
                 ui.separator();
                 ui.label(
-                    RichText::new(format!("Credits: ₡{:.0}", self.state.credits))
+                    RichText::new(format!("Credits: {:.0} Cr", self.state.credits))
                         .strong()
                         .color(Color32::from_rgb(250, 215, 90)),
                 );
@@ -164,15 +321,50 @@ impl SwarmForgeApp {
                 ui.label(format!("Shipped: {}", self.state.total_products_shipped));
                 ui.separator();
                 ui.label(format!(
-                    "Pathing η: {:.0}% ({} opts)",
+                    "Pathing Eff: {:.0}% ({} opts)",
                     self.state.layout_efficiency * 100.0,
                     self.state.builder_optimizations_done
                 ));
                 ui.separator();
                 ui.label(format!("Swarm SCI: {:.2}x", self.state.swarm_coherence));
                 ui.separator();
+                let power_ok = self.state.power_demand_kw <= self.state.power_supply_kw;
+                let power_color = if power_ok {
+                    Color32::from_rgb(95, 235, 165)
+                } else {
+                    Color32::from_rgb(255, 115, 85)
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "Power: {:.1}/{:.1} kW",
+                        self.state.power_demand_kw, self.state.power_supply_kw
+                    ))
+                    .color(power_color),
+                );
+                ui.separator();
+                let coolant_color = if self.state.coolant_pressure_psi >= 85.0 {
+                    Color32::from_rgb(115, 225, 255)
+                } else {
+                    Color32::from_rgb(250, 195, 75)
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "Coolant: {:.0} psi",
+                        self.state.coolant_pressure_psi
+                    ))
+                    .color(coolant_color),
+                );
+                ui.separator();
+                ui.label(format!("Flare T{}", self.state.warehouse_flare_tier));
+                ui.separator();
+                if ui.button("About").clicked() {
+                    self.show_about = !self.show_about;
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
                 if ui
-                    .button(if self.paused { "▶ Resume" } else { "⏸ Pause" })
+                    .button(if self.paused { "> Resume" } else { "|| Pause" })
                     .clicked()
                 {
                     self.paused = !self.paused;
@@ -185,42 +377,39 @@ impl SwarmForgeApp {
                         self.sim_speed = spd;
                     }
                 }
-                if ui.button("⚡ Pulse Sell").clicked() {
+                if ui.button("Pulse Sell").clicked() {
                     complete_deliveries(&mut self.state, 1);
                 }
                 if !self.state.disasters.is_empty()
                     && ui
                         .button(
-                            RichText::new(format!("🧯 Suppress ({})", self.state.disasters.len()))
+                            RichText::new(format!("[!] Suppress ({})", self.state.disasters.len()))
                                 .color(Color32::from_rgb(255, 130, 95)),
                         )
                         .clicked()
                 {
                     crate::disasters::trigger_emergency_suppression(&mut self.state);
                 }
-                if ui.button("🔥 Drill").on_hover_text("Trigger test hazard drill").clicked() {
+                if ui
+                    .button("Drill")
+                    .on_hover_text("Trigger test hazard drill")
+                    .clicked()
+                {
                     crate::disasters::spawn_random_disaster(&mut self.state);
                 }
-                ui.label(format!("Flare T{}", self.state.warehouse_flare_tier));
-            });
-
-            ui.horizontal_wrapped(|ui| {
+                ui.separator();
                 ui.label("Floor View:");
                 for f in FloorId::ALL {
                     let active = self.camera.view_mode == FloorViewMode::Single(f);
-                    if ui
-                        .selectable_label(active, format!("{} — {}", f.code(), f.title()))
-                        .clicked()
-                    {
+                    if ui.selectable_label(active, f.title()).clicked() {
                         self.camera.view_mode = FloorViewMode::Single(f);
                     }
                 }
                 let cut = self.camera.view_mode == FloorViewMode::AllFloorsCutaway;
-                if ui.selectable_label(cut, "0 — 4-Floor Cutaway").clicked() {
+                if ui.selectable_label(cut, "0: 4-Floor Cutaway").clicked() {
                     self.camera.view_mode = FloorViewMode::AllFloorsCutaway;
                 }
                 ui.separator();
-                // Always-visible Floor 1 Expansion button right on the top Floor bar!
                 let span = self.state.main_floor_half_extent * 2;
                 let open_slots = count_open_spaced_slots(&self.state, FloorId::MainFloor);
                 if let Some(cost) = expansion_cost(&self.state) {
@@ -229,17 +418,20 @@ impl SwarmForgeApp {
                         .add_enabled(
                             self.state.credits >= cost,
                             egui::Button::new(format!(
-                                "⊞ Expand F1 ({span}x{span} → {next_span}x{next_span} · ₡{cost:.0}) [{open_slots} open]"
+                                "+ Expand F1 ({span}x{span} -> {next_span}x{next_span} | {cost:.0} Cr) [{open_slots} open]"
                             )),
                         )
                         .clicked()
                     {
-                        let _ = expand_main_floor(&mut self.state);
+                        if let Err(e) = expand_main_floor(&mut self.state) {
+                            self.status_banner = e.clone();
+                            self.state.push_log(e);
+                        }
                     }
                 } else {
                     ui.label(format!("F1 Max 26x26 ({open_slots} open bays)"));
                 }
-                if ui.button("↺ Rotate 90°").clicked() {
+                if ui.button("Rotate 90 deg").clicked() {
                     self.camera.yaw += std::f32::consts::FRAC_PI_2;
                 }
             });
@@ -248,7 +440,53 @@ impl SwarmForgeApp {
 
     fn draw_bottom_log(&mut self, ctx: &Context) {
         egui::TopBottomPanel::bottom("bottom_telemetry").show(ctx, |ui| {
+            if self.event_log_expanded {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Facility Event Log ({}/40 entries)",
+                            self.state.event_log.len()
+                        ))
+                        .strong(),
+                    );
+                    if ui.small_button("Collapse").clicked() {
+                        self.event_log_expanded = false;
+                    }
+                });
+                ScrollArea::vertical()
+                    .id_salt("event_log_drawer")
+                    .max_height(150.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for (idx, entry) in self.state.event_log.iter().enumerate() {
+                            let color = if entry.starts_with("ALERT:") || entry.contains("failed") {
+                                Color32::from_rgb(255, 130, 95)
+                            } else if entry.starts_with("Contract Complete")
+                                || entry.starts_with("Milestone")
+                            {
+                                Color32::from_rgb(95, 235, 145)
+                            } else {
+                                Color32::from_rgb(205, 215, 228)
+                            };
+                            ui.label(
+                                RichText::new(format!("[{:02}] {entry}", idx + 1))
+                                    .small()
+                                    .color(color),
+                            );
+                        }
+                    });
+                ui.separator();
+            }
+
             ui.horizontal(|ui| {
+                let toggle_lbl = if self.event_log_expanded {
+                    format!("v Log ({})", self.state.event_log.len())
+                } else {
+                    format!("^ Log ({})", self.state.event_log.len())
+                };
+                if ui.small_button(toggle_lbl).clicked() {
+                    self.event_log_expanded = !self.event_log_expanded;
+                }
                 let latest = self
                     .state
                     .event_log
@@ -267,13 +505,64 @@ impl SwarmForgeApp {
                     ));
                 });
             });
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Status: {}", self.status_banner))
+                        .small()
+                        .color(Color32::from_rgb(165, 190, 215)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("Copyright CRV Science Network")
+                            .small()
+                            .color(Color32::from_rgb(155, 185, 220)),
+                    );
+                });
+            });
         });
+    }
+
+    fn draw_about_window(&mut self, ctx: &Context) {
+        if !self.show_about {
+            return;
+        }
+        egui::Window::new("About SwarmForge")
+            .open(&mut self.show_about)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.heading(format!("SwarmForge v{}", env!("CARGO_PKG_VERSION")));
+                ui.label(
+                    "3D Isometric Automated Robotic Factory & Swarm Intelligence Simulation",
+                );
+                ui.separator();
+                ui.label(RichText::new("Copyright CRV Science Network").strong());
+                ui.label(
+                    "Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later).",
+                );
+                ui.small("This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.");
+                ui.add_space(6.0);
+                ui.hyperlink_to(
+                    "CRV Science Network (https://crvscience.com)",
+                    "https://crvscience.com",
+                );
+                ui.hyperlink_to(
+                    "CRV Science Public Apps (https://crvscience.com/apps)",
+                    "https://crvscience.com/apps",
+                );
+                ui.hyperlink_to(
+                    "SwarmForge Preprint",
+                    "https://crvscience.com/apps/preprints/swarmforge-isometric-swarm-factory-game",
+                );
+            });
     }
 
     fn draw_left_command_dock(&mut self, ctx: &Context) {
         egui::SidePanel::left("command_dock")
             .resizable(true)
-            .default_width(370.0)
+            .default_width(380.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, SidebarTab::Robots, "Robots");
@@ -319,12 +608,16 @@ impl SwarmForgeApp {
                         if ui
                             .add_enabled(
                                 self.state.credits >= cost,
-                                egui::Button::new(format!("Buy ₡{cost:.0}")),
+                                egui::Button::new(format!("Buy ({cost:.0} Cr)")),
                             )
                             .clicked()
                         {
-                            if let Err(e) = purchase_robot(&mut self.state, kind) {
-                                self.status_banner = e;
+                            match purchase_robot(&mut self.state, kind) {
+                                Ok(id) => {
+                                    self.status_banner =
+                                        format!("Commissioned {} #{id}.", kind.label());
+                                }
+                                Err(e) => self.status_banner = e,
                             }
                         }
                     });
@@ -345,23 +638,84 @@ impl SwarmForgeApp {
                 ))
                 .strong(),
             );
-            ui.small("Strict 2-bay minimum clearance keeps wide 360° corridors around every station.");
+            ui.small("Strict 2-bay minimum clearance keeps wide 360-deg corridors around every station.");
             if let Some(cost) = expansion_cost(&self.state) {
                 if ui
                     .add_enabled(
                         self.state.credits >= cost,
                         egui::Button::new(format!(
-                            "⊞ Expand Floor 1 to {}x{} Bays (₡{cost:.0})",
+                            "+ Expand Floor 1 to {}x{} Bays ({cost:.0} Cr)",
                             span + 2,
                             span + 2
                         )),
                     )
                     .clicked()
                 {
-                    let _ = expand_main_floor(&mut self.state);
+                    match expand_main_floor(&mut self.state) {
+                        Ok(()) => {
+                            let new_span = self.state.main_floor_half_extent * 2;
+                            self.status_banner =
+                                format!("Expanded Floor 1 to {new_span}x{new_span} bays.");
+                        }
+                        Err(e) => {
+                            self.status_banner = e.clone();
+                            self.state.push_log(e);
+                        }
+                    }
                 }
             } else {
                 ui.small("Maximum 26x26 Megafactory slab unlocked.");
+            }
+        });
+
+        ui.separator();
+        ui.group(|ui| {
+            ui.label(RichText::new("Manual Bay Placement (gx, gz):").strong());
+            let max_half = floor_half_extent(&self.state, FloorId::MainFloor);
+            ui.horizontal(|ui| {
+                ui.label("gx:");
+                ui.add(egui::DragValue::new(&mut self.manual_gx).range(-max_half..=(max_half - 1)));
+                ui.label("gz:");
+                ui.add(egui::DragValue::new(&mut self.manual_gz).range(-max_half..=(max_half - 1)));
+                match can_place_module_at(
+                    &self.state,
+                    FloorId::MainFloor,
+                    self.manual_gx,
+                    self.manual_gz,
+                ) {
+                    Ok(()) => {
+                        ui.label(
+                            RichText::new("F1 Bay Open")
+                                .small()
+                                .color(Color32::from_rgb(95, 235, 145)),
+                        );
+                    }
+                    Err(_) => {
+                        ui.label(
+                            RichText::new("F1 Bay Blocked")
+                                .small()
+                                .color(Color32::from_rgb(255, 130, 95)),
+                        );
+                    }
+                }
+            });
+            if let Some(armed) = self.placement_mode {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Click {} floor in 3D canvas to place {}",
+                            armed.floor().code(),
+                            armed.label()
+                        ))
+                        .small()
+                        .color(Color32::from_rgb(80, 220, 250)),
+                    );
+                    if ui.small_button("Cancel").clicked() {
+                        self.placement_mode = None;
+                    }
+                });
+            } else {
+                ui.small("Use '@(gx,gz)' for exact coordinates or 'Click' to place on the 3D floor.");
             }
         });
 
@@ -378,7 +732,7 @@ impl SwarmForgeApp {
                     unlocked,
                     egui::RadioButton::new(
                         self.state.active_product_tier == bp.tier,
-                        format!("T{}: {} (₡{:.0})", bp.tier, bp.name, bp.base_value),
+                        format!("T{}: {} ({:.0} Cr)", bp.tier, bp.name, bp.base_value),
                     ),
                 )
                 .clicked()
@@ -423,24 +777,86 @@ impl SwarmForgeApp {
                         ))
                         .strong(),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let btn_lbl = if has_room {
-                            format!("Buy ₡{cost:.0}")
-                        } else {
-                            "Expand Floor".to_string()
-                        };
-                        if ui
-                            .add_enabled(
-                                has_room && self.state.credits >= cost,
-                                egui::Button::new(btn_lbl),
-                            )
-                            .clicked()
-                        {
-                            if let Err(e) = purchase_module(&mut self.state, kind) {
-                                self.status_banner = e;
+                });
+                ui.horizontal(|ui| {
+                    let btn_lbl = if has_room {
+                        format!("Auto ({cost:.0} Cr)")
+                    } else {
+                        "Expand Floor".to_string()
+                    };
+                    if ui
+                        .add_enabled(
+                            has_room && self.state.credits >= cost,
+                            egui::Button::new(btn_lbl),
+                        )
+                        .clicked()
+                    {
+                        match purchase_module(&mut self.state, kind) {
+                            Ok(id) => {
+                                self.status_banner = format!("Installed {} #{id}.", kind.label());
                             }
+                            Err(e) => self.status_banner = e,
                         }
-                    });
+                    }
+
+                    let manual_ok = can_place_module_at(
+                        &self.state,
+                        kind.floor(),
+                        self.manual_gx,
+                        self.manual_gz,
+                    )
+                    .is_ok()
+                        && self.state.credits >= cost;
+                    if ui
+                        .add_enabled(
+                            manual_ok,
+                            egui::Button::new(format!(
+                                "@({},{})",
+                                self.manual_gx, self.manual_gz
+                            )),
+                        )
+                        .on_hover_text("Place directly at manual (gx, gz)")
+                        .clicked()
+                    {
+                        match purchase_module_at(
+                            &mut self.state,
+                            kind,
+                            self.manual_gx,
+                            self.manual_gz,
+                        ) {
+                            Ok(id) => {
+                                self.status_banner = format!(
+                                    "Placed {} #{id} at ({}, {}).",
+                                    kind.label(),
+                                    self.manual_gx,
+                                    self.manual_gz
+                                );
+                            }
+                            Err(e) => self.status_banner = e,
+                        }
+                    }
+
+                    let armed = self.placement_mode == Some(kind);
+                    if ui
+                        .add_enabled(
+                            self.state.credits >= cost,
+                            egui::SelectableLabel::new(armed, "Click Floor"),
+                        )
+                        .on_hover_text("Arm click-to-place on the 3D floor")
+                        .clicked()
+                    {
+                        if armed {
+                            self.placement_mode = None;
+                        } else {
+                            self.placement_mode = Some(kind);
+                            self.camera.view_mode = FloorViewMode::Single(kind.floor());
+                            self.status_banner = format!(
+                                "Click {} floor bay in 3D canvas to place {}.",
+                                kind.floor().code(),
+                                kind.label()
+                            );
+                        }
+                    }
                 });
             });
         }
@@ -450,11 +866,11 @@ impl SwarmForgeApp {
         for (branch, title) in [
             (
                 TechBranch::SwarmIntelligence,
-                "Swarm Intelligence Tree (S1–S8)",
+                "Swarm Intelligence Tree (S1-S8)",
             ),
             (
                 TechBranch::RoboticsAndFacility,
-                "Robotics & Multi-Floor Tree (R1–R8)",
+                "Robotics & Multi-Floor Tree (R1-R8)",
             ),
         ] {
             ui.heading(title);
@@ -480,13 +896,22 @@ impl SwarmForgeApp {
                                 .add_enabled(
                                     ready,
                                     egui::Button::new(format!(
-                                        "{:.0} RP + ₡{:.0}",
+                                        "{:.0} RP + {:.0} Cr",
                                         node.rp_cost, node.credit_cost
                                     )),
                                 )
                                 .clicked()
                             {
-                                let _ = unlock_tech(&mut self.state, node.id);
+                                match unlock_tech(&mut self.state, node.id) {
+                                    Ok(()) => {
+                                        self.status_banner =
+                                            format!("Researched [{}] {}.", node.code, node.name);
+                                    }
+                                    Err(e) => {
+                                        self.status_banner = e.clone();
+                                        self.state.push_log(e);
+                                    }
+                                }
                             }
                         });
                     });
@@ -506,7 +931,7 @@ impl SwarmForgeApp {
                 let frac =
                     (c.delivered_units as f32 / c.required_units.max(1) as f32).clamp(0.0, 1.0);
                 ui.add(egui::ProgressBar::new(frac).text(format!(
-                    "{}/{} shipped | Bonus: +₡{:.0}, +{:.0} RP",
+                    "{}/{} shipped | Bonus: +{:.0} Cr, +{:.0} RP",
                     c.delivered_units, c.required_units, c.bonus_credits, c.bonus_rp
                 )));
             });
@@ -515,45 +940,118 @@ impl SwarmForgeApp {
 
     fn ui_persistence_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("SQLite WAL Slots & JSON Sync");
+        if let Some(err) = &self.save_store_error {
+            ui.label(
+                RichText::new(format!("SQLite Error: {err}"))
+                    .small()
+                    .color(Color32::from_rgb(255, 115, 95)),
+            );
+        }
+        if let Some((ok, msg)) = &self.persistence_msg {
+            let col = if *ok {
+                Color32::from_rgb(95, 235, 145)
+            } else {
+                Color32::from_rgb(255, 115, 95)
+            };
+            ui.label(RichText::new(msg).small().color(col));
+        }
+
         ui.horizontal(|ui| {
             ui.label("Slot:");
             ui.text_edit_singleline(&mut self.slot_input);
         });
         ui.horizontal(|ui| {
             if ui.button("Save SQLite Slot").clicked() {
-                if let Some(store) = &self.save_store {
-                    match store.save_slot(&self.slot_input, &self.state) {
-                        Ok(()) => self
-                            .state
-                            .push_log(format!("Saved slot '{}'.", self.slot_input)),
-                        Err(e) => self.state.push_log(e),
-                    }
-                }
+                let name = self.slot_input.clone();
+                self.save_slot_by_name(&name);
             }
             if ui.button("Load SQLite Slot").clicked() {
-                if let Some(store) = &self.save_store {
-                    if let Ok(mut loaded) = store.load_slot(&self.slot_input) {
-                        enforce_spacing_and_migrate(&mut loaded);
-                        self.state = loaded;
+                let name = self.slot_input.clone();
+                self.load_slot_by_name(&name);
+            }
+            if ui.button("Refresh").clicked() {
+                self.refresh_slots();
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label(RichText::new(format!("Saved SQLite Slots ({})", self.slots_cache.len())).strong());
+        if self.slots_cache.is_empty() {
+            ui.small("No saved SQLite slots yet.");
+        } else {
+            let slots = self.slots_cache.clone();
+            for slot in slots {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&slot.slot_name).strong());
+                        ui.small(format!(
+                            "{} | {:.0} Cr | {} shipped | {} bots",
+                            slot.updated_utc, slot.credits, slot.shipped, slot.robot_count
+                        ));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Load").clicked() {
+                            self.load_slot_by_name(&slot.slot_name);
+                        }
+                        if ui.small_button("Overwrite").clicked() {
+                            self.save_slot_by_name(&slot.slot_name);
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            self.delete_slot_by_name(&slot.slot_name);
+                        }
+                    });
+                });
+            }
+        }
+
+        ui.separator();
+        ui.label(RichText::new("JSON Snapshot Import / Export").strong());
+        ui.small(format!("Last path: {}", self.json_path_input));
+        ui.horizontal(|ui| {
+            if ui.button("Export JSON...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("SwarmForge JSON", &["json"])
+                    .set_file_name("swarmforge_save.json")
+                    .save_file()
+                {
+                    match export_json_file(&path, &self.state) {
+                        Ok(()) => {
+                            self.json_path_input = path.display().to_string();
+                            let msg = format!("Exported JSON '{}'.", path.display());
+                            self.state.push_log(msg.clone());
+                            self.set_status(true, msg);
+                        }
+                        Err(e) => {
+                            let msg = format!("JSON export failed: {e}");
+                            self.state.push_log(msg.clone());
+                            self.set_status(false, msg);
+                        }
                     }
                 }
             }
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("JSON:");
-            ui.text_edit_singleline(&mut self.json_path_input);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Export JSON").clicked() {
-                let _ = export_json_file(&self.json_path_input, &self.state);
-                self.state
-                    .push_log(format!("Exported JSON '{}'.", self.json_path_input));
-            }
-            if ui.button("Import JSON").clicked() {
-                if let Ok(mut s) = import_json_file(&self.json_path_input) {
-                    enforce_spacing_and_migrate(&mut s);
-                    self.state = s;
+            if ui.button("Import JSON...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("SwarmForge JSON", &["json"])
+                    .pick_file()
+                {
+                    match import_json_file(&path) {
+                        Ok(mut s) => {
+                            enforce_spacing_and_migrate(&mut s);
+                            self.state = s;
+                            self.selected_entity = None;
+                            self.hovered_entity = None;
+                            self.placement_mode = None;
+                            self.json_path_input = path.display().to_string();
+                            let msg = format!("Imported JSON '{}'.", path.display());
+                            self.state.push_log(msg.clone());
+                            self.set_status(true, msg);
+                        }
+                        Err(e) => {
+                            let msg = format!("JSON import failed: {e}");
+                            self.state.push_log(msg.clone());
+                            self.set_status(false, msg);
+                        }
+                    }
                 }
             }
         });
@@ -582,9 +1080,236 @@ impl SwarmForgeApp {
                 }
             }
 
+            let hover_pos = response.hover_pos();
+            self.hovered_entity = hover_pos.and_then(|p| pick_entity(&self.last_hits, p));
+
+            let active_floor = match self.placement_mode {
+                Some(kind) => kind.floor(),
+                None => match self.camera.view_mode {
+                    FloorViewMode::Single(f) => f,
+                    FloorViewMode::AllFloorsCutaway => FloorId::MainFloor,
+                },
+            };
+            let focus_y = self.camera.active_focus_y();
+            let floor_y = self.camera.floor_render_y(active_floor);
+            let hover_cell = hover_pos.and_then(|p| {
+                self.camera
+                    .screen_to_floor_grid(p, rect, focus_y, floor_y)
+            });
+
+            let ghost_bay = match (self.placement_mode, hover_cell) {
+                (Some(kind), Some((gx, gz))) => {
+                    let valid = can_place_module_at(&self.state, kind.floor(), gx, gz).is_ok();
+                    Some((kind.floor(), gx, gz, valid))
+                }
+                _ => None,
+            };
+
+            if response.clicked_by(egui::PointerButton::Secondary) {
+                self.placement_mode = None;
+            }
+
+            if response.clicked_by(egui::PointerButton::Primary) {
+                if let Some(kind) = self.placement_mode {
+                    if let Some((gx, gz)) = hover_cell {
+                        match purchase_module_at(&mut self.state, kind, gx, gz) {
+                            Ok(id) => {
+                                self.status_banner = format!(
+                                    "Placed {} #{id} at {} bay ({gx}, {gz}).",
+                                    kind.label(),
+                                    kind.floor().code()
+                                );
+                                self.selected_entity = Some(HitEntity::Module(id));
+                                self.placement_mode = None;
+                            }
+                            Err(e) => {
+                                self.status_banner = e;
+                            }
+                        }
+                    }
+                } else if let Some(pos) = response.interact_pointer_pos() {
+                    self.selected_entity = pick_entity(&self.last_hits, pos);
+                }
+            }
+
             let painter = ui.painter_at(rect);
-            render_isometric_factory(&painter, rect, &self.state, &self.camera);
+            let pick_res = render_isometric_factory_interactive(
+                &painter,
+                rect,
+                &self.state,
+                &self.camera,
+                self.selected_entity,
+                self.hovered_entity,
+                ghost_bay,
+            );
+            self.last_hits = pick_res.entities;
+
+            if let Some(kind) = self.placement_mode {
+                if let Some((gx, gz)) = hover_cell {
+                    let valid = can_place_module_at(&self.state, kind.floor(), gx, gz).is_ok();
+                    response.clone().on_hover_text(format!(
+                        "Place {} at {} ({gx}, {gz}) [{}]",
+                        kind.label(),
+                        kind.floor().code(),
+                        if valid { "Valid" } else { "Blocked" }
+                    ));
+                }
+            } else if let Some(ent) = self.hovered_entity {
+                if let Some(tip) = self.entity_summary(ent) {
+                    response.clone().on_hover_text(tip);
+                }
+            }
+
+            if let Some(ent) = self.selected_entity {
+                self.draw_entity_inspector(ctx, rect, ent);
+            }
         });
+    }
+
+    fn entity_summary(&self, ent: HitEntity) -> Option<String> {
+        match ent {
+            HitEntity::Module(id) => self.state.modules.iter().find(|m| m.id == id).map(|m| {
+                format!(
+                    "{} #{} ({}) bay ({}, {})\nCondition: {:.0}% | In: {} Out: {} | Power: {:.1} kW",
+                    m.kind.label(),
+                    m.id,
+                    m.floor.code(),
+                    m.gx,
+                    m.gz,
+                    m.condition * 100.0,
+                    m.input_buffer,
+                    m.output_buffer,
+                    m.kind.power_draw_kw()
+                )
+            }),
+            HitEntity::Robot(id) => self.state.robots.iter().find(|r| r.id == id).map(|r| {
+                format!(
+                    "{} #{} ({}) pos ({:.1}, {:.1})\nIntegrity: {:.0}% | Tasks: {} | {:?}",
+                    r.kind.label(),
+                    r.id,
+                    r.floor.code(),
+                    r.x,
+                    r.z,
+                    r.integrity * 100.0,
+                    r.tasks_completed,
+                    r.task
+                )
+            }),
+        }
+    }
+
+    fn draw_entity_inspector(&mut self, ctx: &Context, viewport_rect: egui::Rect, ent: HitEntity) {
+        let mut still_open = true;
+        let anchor_pos = egui::pos2(viewport_rect.right() - 285.0, viewport_rect.top() + 10.0);
+        egui::Area::new(egui::Id::new("entity_inspector_card"))
+            .fixed_pos(anchor_pos)
+            .show(ctx, |ui| {
+                egui::Frame::window(ui.style())
+                    .fill(Color32::from_rgba_unmultiplied(16, 24, 36, 235))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(75, 130, 185)))
+                    .show(ui, |ui| {
+                        ui.set_width(265.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("3D Entity Inspector")
+                                    .strong()
+                                    .color(Color32::from_rgb(80, 220, 250)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Close").clicked() {
+                                        still_open = false;
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                        match ent {
+                            HitEntity::Module(id) => {
+                                if let Some(m) = self.state.modules.iter().find(|m| m.id == id) {
+                                    ui.label(
+                                        RichText::new(format!("{} #{}", m.kind.label(), m.id))
+                                            .strong(),
+                                    );
+                                    ui.small(format!("Floor: {}", m.floor.title()));
+                                    ui.label(format!("Grid Bay: ({}, {})", m.gx, m.gz));
+                                    ui.label(format!("Condition: {:.0}%", m.condition * 100.0));
+                                    ui.label(format!(
+                                        "Buffers: In {} / Out {}",
+                                        m.input_buffer, m.output_buffer
+                                    ));
+                                    ui.label(format!(
+                                        "Progress: {:.0}% | Power: {:.1} kW",
+                                        m.work_progress * 100.0,
+                                        m.kind.power_draw_kw()
+                                    ));
+                                    if m.being_relocated {
+                                        ui.label(
+                                            RichText::new("Status: Builder Relocating")
+                                                .color(Color32::from_rgb(255, 215, 75)),
+                                        );
+                                    }
+                                } else {
+                                    ui.small("Module no longer exists.");
+                                }
+                            }
+                            HitEntity::Robot(id) => {
+                                if let Some(r) = self.state.robots.iter().find(|r| r.id == id) {
+                                    ui.label(
+                                        RichText::new(format!("{} #{}", r.kind.label(), r.id))
+                                            .strong(),
+                                    );
+                                    ui.small(format!("Floor: {}", r.floor.title()));
+                                    ui.label(format!("Position: ({:.2}, {:.2})", r.x, r.z));
+                                    ui.label(format!(
+                                        "Integrity: {:.0}% | Energy: {:.0}%",
+                                        r.integrity * 100.0,
+                                        r.energy * 100.0
+                                    ));
+                                    ui.label(format!("Tasks Completed: {}", r.tasks_completed));
+                                    let task_desc = match &r.task {
+                                        RobotTask::Idle => "Idle".to_string(),
+                                        RobotTask::Operating { module_id, .. } => {
+                                            format!("Operating Module #{module_id}")
+                                        }
+                                        RobotTask::CarryingPart {
+                                            stage,
+                                            target_module_id,
+                                            ..
+                                        } => format!(
+                                            "Carrying Stage {stage} -> #{target_module_id}"
+                                        ),
+                                        RobotTask::MovingToRelocate {
+                                            module_id,
+                                            dest_gx,
+                                            dest_gz,
+                                        } => format!(
+                                            "Moving Mod #{module_id} -> ({dest_gx}, {dest_gz})"
+                                        ),
+                                        RobotTask::RelocatingModule {
+                                            module_id,
+                                            dest_gx,
+                                            dest_gz,
+                                            ..
+                                        } => format!(
+                                            "Relocating #{module_id} -> ({dest_gx}, {dest_gz})"
+                                        ),
+                                        RobotTask::SeekingMaintenance { station_id } => {
+                                            format!("Seeking Repair Bay #{station_id}")
+                                        }
+                                    };
+                                    ui.label(format!("Task: {task_desc}"));
+                                } else {
+                                    ui.small("Robot no longer exists.");
+                                }
+                            }
+                        }
+                    });
+            });
+        if !still_open {
+            self.selected_entity = None;
+        }
     }
 }
 
@@ -620,6 +1345,7 @@ fn write_rgba_png(
     let mut encoder = png::Encoder::new(w, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Best);
     let mut writer = encoder.write_header()?;
     writer.write_image_data(rgba)?;
     Ok(())
@@ -689,37 +1415,76 @@ pub fn render_headless_screenshot(
             tick_factory(&mut app.state, 0.1);
         }
     } else if view == 2 {
-        // View 2: Multi-floor / Tech-Tree / Swarm Scaling view
+        // View 2: Multi-floor / Tech-Tree / Swarm Scaling view with translucent cutaway
         app.tab = SidebarTab::SwarmTech;
         app.camera.view_mode = FloorViewMode::AllFloorsCutaway;
         app.camera.zoom = 24.0;
         app.state.credits += 5000.0;
         app.state.research_points += 500.0;
         for node in TECH_TREE.iter().take(4) {
-            let _ = unlock_tech(&mut app.state, node.id);
+            if let Err(e) = unlock_tech(&mut app.state, node.id) {
+                app.status_banner = e;
+            }
         }
-        let _ = purchase_robot(&mut app.state, RobotKind::Assembler);
-        let _ = purchase_robot(&mut app.state, RobotKind::Hauler);
-        let _ = purchase_robot(&mut app.state, RobotKind::Researcher);
-        let _ = purchase_robot(&mut app.state, RobotKind::Maintenance);
+        for kind in [
+            RobotKind::Assembler,
+            RobotKind::Hauler,
+            RobotKind::Researcher,
+            RobotKind::Maintenance,
+        ] {
+            if let Err(e) = purchase_robot(&mut app.state, kind) {
+                app.status_banner = e;
+            }
+        }
         for _ in 0..80 {
             tick_factory(&mut app.state, 0.1);
         }
     } else if view == 3 {
-        // View 3: Disaster Suppression / Fire & Cheer Drone view
+        // View 3: MainFloor Fire Suppression, RepairBot, CheerBot & 3D Inspector view
         app.tab = SidebarTab::Modules;
         app.camera.view_mode = FloorViewMode::Single(FloorId::MainFloor);
         app.state.credits += 5000.0;
-        let _ = purchase_module(&mut app.state, ModuleKind::FireSuppressionTower);
-        let _ = purchase_robot(&mut app.state, RobotKind::RepairBot);
-        let _ = purchase_robot(&mut app.state, RobotKind::MotivationDrone);
+        let tower_id = purchase_module_at(&mut app.state, ModuleKind::FireSuppressionTower, 1, -3)
+            .or_else(|_| purchase_module(&mut app.state, ModuleKind::FireSuppressionTower))
+            .ok();
+        if let Err(e) = purchase_robot(&mut app.state, RobotKind::RepairBot) {
+            app.status_banner = e;
+        }
+        if let Err(e) = purchase_robot(&mut app.state, RobotKind::MotivationDrone) {
+            app.status_banner = e;
+        }
         for _ in 0..40 {
             tick_factory(&mut app.state, 0.1);
         }
-        crate::disasters::spawn_random_disaster(&mut app.state);
+        if let Some(proto) = app
+            .state
+            .modules
+            .iter()
+            .find(|m| m.floor == FloorId::MainFloor && m.kind == ModuleKind::ProtoBench)
+            .cloned()
+        {
+            let did = app.state.alloc_id();
+            app.state.disasters.push(ActiveDisaster {
+                id: did,
+                kind: DisasterKind::ThermalFire,
+                floor: FloorId::MainFloor,
+                module_id: proto.id,
+                x: proto.visual_x,
+                z: proto.visual_z,
+                severity: 0.85,
+                suppressed_by_tower: false,
+            });
+            app.state.push_log(format!(
+                "ALERT: Thermal Station Fire erupted at {} on F1!",
+                proto.kind.label()
+            ));
+        } else {
+            crate::disasters::spawn_random_disaster(&mut app.state);
+        }
         for _ in 0..15 {
             tick_factory(&mut app.state, 0.1);
         }
+        app.selected_entity = tower_id.map(HitEntity::Module);
     }
 
     let warmup_delays_ms = [50u64, 30, 20, 20];
@@ -814,7 +1579,9 @@ pub fn render_headless_screenshot(
     let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
+        if let Err(e) = tx.send(res) {
+            eprintln!("map_async send error: {e}");
+        }
     });
     device.poll(wgpu::Maintain::Wait);
     rx.recv()??;
