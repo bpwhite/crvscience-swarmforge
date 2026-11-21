@@ -34,7 +34,7 @@ preferred-citation:
   notes: "Preprint ID: APP-PREPRINT-18"
 references:
   - type: article
-    title: "The CRV Science App Network: Seventeen Open-Source Rust Programs for Science, Data, and Simulation"
+    title: "The CRV Science App Network: Twenty Open-Source Rust Programs for Science, Data, and Simulation"
     authors:
       - family-names: "White"
         given-names: "Bryan P."
