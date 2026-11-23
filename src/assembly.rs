@@ -33,9 +33,10 @@ pub fn tick_factory(state: &mut GameState, dt: f32) {
     check_achievements(state);
 }
 
-fn tick_assembly_line(state: &mut GameState, dt: f32) {
+pub fn tick_assembly_line(state: &mut GameState, dt: f32) {
     let mult = compute_multipliers(state);
     state.swarm_coherence = mult.coherence_index;
+    let lights_out = state.has_tech("robo_lights_out");
 
     let grid_factor = if state.power_demand_kw <= state.power_supply_kw {
         1.0
@@ -51,7 +52,7 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
     let mut active_stages: Vec<u8> = state
         .modules
         .iter()
-        .filter(|m| m.floor == FloorId::MainFloor && !m.being_relocated)
+        .filter(|m| m.floor == FloorId::MainFloor && (!m.being_relocated || lights_out))
         .filter_map(|m| m.kind.pipeline_stage())
         .collect();
     active_stages.sort_unstable();
@@ -70,6 +71,7 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
     };
     for m in state.modules.iter_mut() {
         if m.floor == FloorId::MainFloor
+            && (!m.being_relocated || lights_out)
             && m.kind.pipeline_stage() == Some(first_prod_stage)
             && m.input_buffer < 6
             && state.raw_material_stock >= 1.0
@@ -92,7 +94,7 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
 
     for m_idx in 0..state.modules.len() {
         let m = &state.modules[m_idx];
-        if m.floor != FloorId::MainFloor || m.being_relocated {
+        if m.floor != FloorId::MainFloor || (m.being_relocated && !lights_out) {
             continue;
         }
         let Some(stage) = m.kind.pipeline_stage() else {
@@ -140,10 +142,13 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
 
         let m_mut = &mut state.modules[m_idx];
         m_mut.work_progress += rate * dt;
-        if m_mut.work_progress >= 1.0 {
+        while m_mut.work_progress >= 1.0 && m_mut.input_buffer > 0 && m_mut.output_buffer < 8 {
             m_mut.work_progress -= 1.0;
-            m_mut.input_buffer = m_mut.input_buffer.saturating_sub(1);
+            m_mut.input_buffer -= 1;
             m_mut.output_buffer += 1;
+        }
+        if m_mut.input_buffer == 0 || m_mut.output_buffer >= 8 {
+            m_mut.work_progress = m_mut.work_progress.min(0.99);
         }
     }
 
@@ -176,7 +181,7 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
                 let mut assigned = false;
                 if can_haul {
                     if let Some((src_id, src_stage, dst_id)) =
-                        find_haul_job(&state.modules, &active_stages)
+                        find_haul_job(&state.modules, &active_stages, lights_out)
                     {
                         if let Some(src_m) = state.modules.iter_mut().find(|m| m.id == src_id) {
                             src_m.output_buffer = src_m.output_buffer.saturating_sub(1);
@@ -206,7 +211,7 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
                         .iter()
                         .filter(|m| {
                             m.floor == FloorId::MainFloor
-                                && !m.being_relocated
+                                && (!m.being_relocated || lights_out)
                                 && m.kind.pipeline_stage().map(|s| s <= 4).unwrap_or(false)
                                 && m.input_buffer > 0
                                 && m.output_buffer < 8
@@ -244,7 +249,7 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
                     let still_has_work = state
                         .modules
                         .iter()
-                        .find(|m| m.id == module_id && !m.being_relocated)
+                        .find(|m| m.id == module_id && (!m.being_relocated || lights_out))
                         .map(|m| m.input_buffer > 0 && m.output_buffer < 8)
                         .unwrap_or(false);
 
@@ -306,11 +311,15 @@ fn tick_assembly_line(state: &mut GameState, dt: f32) {
 fn find_haul_job(
     modules: &[crate::model::FactoryModule],
     active_stages: &[u8],
+    lights_out: bool,
 ) -> Option<(u32, u8, u32)> {
     let mut ordered: Vec<&crate::model::FactoryModule> = modules.iter().collect();
     ordered.sort_by_key(|m| std::cmp::Reverse(m.kind.pipeline_stage().unwrap_or(0)));
     for m in ordered {
-        if m.floor != FloorId::MainFloor || m.being_relocated || m.output_buffer == 0 {
+        if m.floor != FloorId::MainFloor
+            || (m.being_relocated && !lights_out)
+            || m.output_buffer == 0
+        {
             continue;
         }
         let Some(st) = m.kind.pipeline_stage() else {
@@ -323,7 +332,7 @@ fn find_haul_job(
             .iter()
             .filter(|d| {
                 d.floor == FloorId::MainFloor
-                    && !d.being_relocated
+                    && (!d.being_relocated || lights_out)
                     && d.kind.pipeline_stage() == Some(next_stage)
                     && (d.kind == ModuleKind::DeliveryDock || d.input_buffer < 8)
             })
@@ -435,5 +444,44 @@ mod tests {
 
         assert!(state.total_products_shipped >= 1);
         assert!(state.credits > start_credits);
+    }
+
+    #[test]
+    fn lights_out_relocation_produces_and_while_loop_emits_multi_unit_ticks() {
+        use crate::model::FactoryModule;
+
+        let mut base = GameState::new_starter_factory();
+        base.robots.clear();
+        base.modules.clear();
+        base.disasters.clear();
+        base.raw_material_stock = 0.0;
+        base.power_demand_kw = 20.0;
+        base.power_supply_kw = 45.0;
+        base.coolant_pressure_psi = 90.0;
+        base.layout_efficiency = (1.0 - 0.65) / 0.75; // layout_bonus == 1.0
+        base.active_product_tier = 1;
+
+        let mut mod_fab = FactoryModule::new(10, ModuleKind::FabricationCell, FloorId::MainFloor, 0, 0);
+        mod_fab.input_buffer = 5;
+        mod_fab.being_relocated = true;
+        base.modules.push(mod_fab);
+
+        // Without robo_lights_out, relocating module does not advance
+        let mut locked = base.clone();
+        tick_assembly_line(&mut locked, 10.0);
+        assert_eq!(locked.modules[0].output_buffer, 0);
+        assert_eq!(locked.modules[0].work_progress, 0.0);
+
+        // With robo_lights_out unlocked, FabricationCell auto_baseline = 0.08 -> rate = 0.55 * 0.08 = 0.044.
+        // Choose dt so rate * dt == 2.5 exactly -> emits 2 output units and retains 0.5 work_progress.
+        let mut unlocked = base;
+        unlocked.unlocked_techs.push("robo_lights_out".to_string());
+        let expected_rate = 0.55 * 0.08;
+        let dt = 2.5 / expected_rate;
+        tick_assembly_line(&mut unlocked, dt);
+
+        assert_eq!(unlocked.modules[0].output_buffer, 2);
+        assert_eq!(unlocked.modules[0].input_buffer, 3);
+        assert!((unlocked.modules[0].work_progress - 0.5).abs() < 1e-4);
     }
 }

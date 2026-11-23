@@ -278,6 +278,22 @@ pub fn build_robot_parts(out: &mut Vec<BoxPart>, r: &Robot, fy: f32, time_s: f32
     }
 }
 
+/// Computes the local 3D world offset of a `DeliveryDock` cargo drone along its sortie trajectory.
+pub fn delivery_dock_drone_offset(sortie_progress: f32, time_s: f32) -> Vec3 {
+    if sortie_progress <= 0.001 {
+        Vec3::new(0.16, 0.46 + (time_s * 3.0).sin().abs() * 0.12, 0.24)
+    } else if sortie_progress < 0.25 {
+        let u = sortie_progress / 0.25;
+        Vec3::new(0.16, 0.46 + u * 5.2, 0.24)
+    } else if sortie_progress < 0.65 {
+        let u = (sortie_progress - 0.25) / 0.40;
+        Vec3::new(0.16 + u * 22.0, 5.66 + u * 4.5, 0.24 - u * 16.0)
+    } else {
+        let u = 1.0 - (sortie_progress - 0.65) / 0.35;
+        Vec3::new(0.16 + u * 14.0, 0.46 + u * 5.8, 0.24 + u * 10.0)
+    }
+}
+
 /// Builds unique, detailed 3D architectural & mechanical sub-parts for each of the 19 Module types.
 pub fn build_module_parts(out: &mut Vec<BoxPart>, m: &FactoryModule, fy: f32, time_s: f32) {
     if m.kind == ModuleKind::VerticalFreightLift {
@@ -415,19 +431,7 @@ pub fn build_module_parts(out: &mut Vec<BoxPart>, m: &FactoryModule, fy: f32, ti
                 [56, 235, 255],
             ));
             // Outbound cargo drone: flies dramatic climb -> skyward arc -> return landing sortie!
-            let p = m.drone_sortie_progress;
-            let drone_offset = if p <= 0.001 {
-                Vec3::new(0.16, 0.46 + (time_s * 3.0).sin().abs() * 0.12, 0.24)
-            } else if p < 0.25 {
-                let u = p / 0.25;
-                Vec3::new(0.16, 0.46 + u * 5.2, 0.24)
-            } else if p < 0.65 {
-                let u = (p - 0.25) / 0.40;
-                Vec3::new(0.16 + u * 22.0, 5.66 + u * 4.5, 0.24 - u * 16.0)
-            } else {
-                let u = 1.0 - (p - 0.65) / 0.35;
-                Vec3::new(0.16 + u * 14.0, 0.46 + u * 5.8, 0.24 + u * 10.0)
-            };
+            let drone_offset = delivery_dock_drone_offset(m.drone_sortie_progress, time_s);
             out.push(BoxPart::axis_aligned(c + drone_offset, Vec3::new(0.58, 0.20, 0.58), [250, 204, 21]));
             out.push(BoxPart::axis_aligned(c + drone_offset + Vec3::new(0.0, -0.14, 0.0), Vec3::new(0.32, 0.16, 0.32), [56, 189, 248]));
         }

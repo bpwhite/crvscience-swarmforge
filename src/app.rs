@@ -17,6 +17,7 @@
 
 use crate::assembly::{complete_deliveries, tick_factory};
 use crate::builder_ai::count_open_spaced_slots;
+use crate::disasters::{CHEER_AURA_RADIUS, SUPPRESSION_RADIUS};
 use crate::floors::{
     can_place_module_at, expand_main_floor, expansion_cost, floor_half_extent, module_current_cost,
     purchase_module, purchase_module_at, purchase_robot, robot_current_cost,
@@ -44,10 +45,17 @@ enum SidebarTab {
     Persistence,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AboutTab {
+    Overview,
+    Shortcuts,
+}
+
 pub struct SwarmForgeApp {
     pub state: GameState,
     camera: IsoCamera,
     tab: SidebarTab,
+    about_tab: AboutTab,
     sim_speed: f32,
     paused: bool,
     last_frame: Instant,
@@ -87,6 +95,7 @@ impl SwarmForgeApp {
             state,
             camera: IsoCamera::default(),
             tab: SidebarTab::Robots,
+            about_tab: AboutTab::Overview,
             sim_speed: 1.0,
             paused: false,
             last_frame: Instant::now(),
@@ -116,6 +125,7 @@ impl SwarmForgeApp {
             state,
             camera: IsoCamera::default(),
             tab: SidebarTab::Robots,
+            about_tab: AboutTab::Overview,
             sim_speed: 1.0,
             paused: true,
             last_frame: Instant::now(),
@@ -144,6 +154,21 @@ impl SwarmForgeApp {
 
     pub fn set_event_log_expanded(&mut self, expanded: bool) {
         self.event_log_expanded = expanded;
+    }
+
+    fn apply_factory_preset(&mut self, mut preset: GameState, label: &str) {
+        enforce_spacing_and_migrate(&mut preset);
+        self.state = preset;
+        self.selected_entity = None;
+        self.hovered_entity = None;
+        self.placement_mode = None;
+        self.camera.reset_view();
+        if self.state.main_floor_half_extent >= 12 {
+            self.camera.zoom = 13.0;
+        } else if self.state.main_floor_half_extent >= 7 {
+            self.camera.zoom = 16.5;
+        }
+        self.status_banner = format!("Loaded factory preset: {label}.");
     }
 
     fn set_status(&mut self, ok: bool, msg: String) {
@@ -299,6 +324,31 @@ impl SwarmForgeApp {
                 if i.key_pressed(egui::Key::E) {
                     self.camera.yaw += std::f32::consts::FRAC_PI_2;
                 }
+                let pan_step = 420.0 * raw_dt.max(1.0 / 60.0);
+                if i.key_down(egui::Key::W) {
+                    self.camera.pan_y += pan_step;
+                }
+                if i.key_down(egui::Key::S) {
+                    self.camera.pan_y -= pan_step;
+                }
+                if i.key_down(egui::Key::A) {
+                    self.camera.pan_x += pan_step;
+                }
+                if i.key_down(egui::Key::D) {
+                    self.camera.pan_x -= pan_step;
+                }
+                if i.key_pressed(egui::Key::R) {
+                    self.camera.reset_view();
+                    self.status_banner = "Camera reset to default isometric view.".to_string();
+                }
+                if i.key_pressed(egui::Key::OpenBracket) {
+                    self.sim_speed = if self.sim_speed > 3.0 { 2.0 } else { 1.0 };
+                    self.status_banner = format!("Simulation speed: {:.0}x", self.sim_speed);
+                }
+                if i.key_pressed(egui::Key::CloseBracket) {
+                    self.sim_speed = if self.sim_speed < 1.5 { 2.0 } else { 4.0 };
+                    self.status_banner = format!("Simulation speed: {:.0}x", self.sim_speed);
+                }
             }
         });
 
@@ -400,7 +450,13 @@ impl SwarmForgeApp {
                         self.sim_speed = spd;
                     }
                 }
-                if ui.button("Pulse Sell").clicked() {
+                if ui
+                    .button("Pulse Sell")
+                    .on_hover_text(
+                        "Instantly dispatch 1 unit of the active product tier from Delivery Docks (+Credits & +0.45 RP)",
+                    )
+                    .clicked()
+                {
                     complete_deliveries(&mut self.state, 1);
                 }
                 if !self.state.disasters.is_empty()
@@ -454,9 +510,29 @@ impl SwarmForgeApp {
                 } else {
                     ui.label(format!("F1 Max 26x26 ({open_slots} open bays)"));
                 }
-                if ui.button("Rotate 90 deg").clicked() {
+                if ui
+                    .button("Rotate 90 deg")
+                    .on_hover_text("Orbit isometric camera yaw +90 deg (Hotkeys: Q / E)")
+                    .clicked()
+                {
                     self.camera.yaw += std::f32::consts::FRAC_PI_2;
                 }
+                if ui
+                    .button("Reset Cam (R)")
+                    .on_hover_text("Reset camera yaw, pitch, zoom, pan, and floor view (Hotkey: R)")
+                    .clicked()
+                {
+                    self.camera.reset_view();
+                    self.status_banner = "Camera reset to default isometric view.".to_string();
+                }
+                ui.separator();
+                ui.label("Overlays:");
+                ui.toggle_value(&mut self.camera.show_suppression_overlay, "Cryo")
+                    .on_hover_text("Toggle FireSuppressionTower cryo-foam coverage rings (R = 10.5u)");
+                ui.toggle_value(&mut self.camera.show_cheer_overlay, "Cheer")
+                    .on_hover_text("Toggle CheerBot MotivationDrone morale aura rings (R = 8.5u)");
+                ui.toggle_value(&mut self.camera.show_congestion_overlay, "Heat")
+                    .on_hover_text("Toggle Floor 1 A* corridor congestion heat tiles");
             });
         });
     }
@@ -570,29 +646,68 @@ impl SwarmForgeApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.heading(format!("SwarmForge v{}", env!("CARGO_PKG_VERSION")));
-                ui.label(
-                    "3D Isometric Automated Robotic Factory & Swarm Intelligence Simulation",
-                );
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.about_tab, AboutTab::Overview, "Overview & License");
+                    ui.selectable_value(&mut self.about_tab, AboutTab::Shortcuts, "Shortcuts Cheat Sheet");
+                });
                 ui.separator();
-                ui.label(RichText::new("Copyright CRV Science Network").strong());
-                ui.label(
-                    "Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later).",
-                );
-                ui.small("This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.");
-                ui.add_space(6.0);
-                ui.hyperlink_to(
-                    "CRV Science Network (https://crvscience.com)",
-                    "https://crvscience.com",
-                );
-                ui.hyperlink_to(
-                    "CRV Science Public Apps (https://crvscience.com/apps)",
-                    "https://crvscience.com/apps",
-                );
-                ui.hyperlink_to(
-                    "SwarmForge Preprint",
-                    "https://crvscience.com/apps/preprints/swarmforge-isometric-swarm-factory-game",
-                );
+
+                match self.about_tab {
+                    AboutTab::Overview => {
+                        ui.heading(format!("SwarmForge v{}", env!("CARGO_PKG_VERSION")));
+                        ui.label(
+                            "3D Isometric Automated Robotic Factory & Swarm Intelligence Simulation",
+                        );
+                        ui.separator();
+                        ui.label(RichText::new("Copyright CRV Science Network").strong());
+                        ui.label(
+                            "Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later).",
+                        );
+                        ui.small("This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.");
+                        ui.add_space(6.0);
+                        ui.hyperlink_to(
+                            "CRV Science Network (https://crvscience.com)",
+                            "https://crvscience.com",
+                        );
+                        ui.hyperlink_to(
+                            "CRV Science Public Apps (https://crvscience.com/apps)",
+                            "https://crvscience.com/apps",
+                        );
+                        ui.hyperlink_to(
+                            "SwarmForge Preprint",
+                            "https://crvscience.com/apps/preprints/swarmforge-isometric-swarm-factory-game",
+                        );
+                    }
+                    AboutTab::Shortcuts => {
+                        ui.heading("Keyboard & Mouse Controls");
+                        ui.small("Single-key shortcuts automatically pause while typing in text inputs.");
+                        ui.add_space(4.0);
+                        egui::Grid::new("swarmforge_shortcut_grid")
+                            .striped(true)
+                            .spacing([18.0, 6.0])
+                            .show(ui, |ui| {
+                                for (key, desc) in [
+                                    ("Space", "Pause / Resume simulation"),
+                                    ("[ / ]", "Cycle simulation speed (1x <-> 2x <-> 4x)"),
+                                    ("W / A / S / D", "Pan 3D isometric viewport"),
+                                    ("Q / E", "Rotate camera yaw -90 / +90 degrees"),
+                                    ("R", "Reset IsoCamera to default angle & zoom"),
+                                    ("1 - 4", "Switch single floor view (B1, F1, F2, F3)"),
+                                    ("0", "Toggle 4-Floor Cutaway X-Ray view"),
+                                    ("Primary-Drag", "Orbit camera yaw and pitch"),
+                                    ("Secondary-Drag", "Pan viewport freely"),
+                                    ("Scroll Wheel", "Zoom camera in / out"),
+                                    ("Shift + Click", "Continuous bay placement (keeps placement armed)"),
+                                    ("Esc", "Close About -> Cancel placement -> Deselect entity"),
+                                    ("F1", "Toggle About & Shortcuts window"),
+                                ] {
+                                    ui.label(RichText::new(key).strong().monospace());
+                                    ui.label(desc);
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                }
             });
     }
 
@@ -601,6 +716,40 @@ impl SwarmForgeApp {
             .resizable(true)
             .default_width(380.0)
             .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Presets:").small().strong());
+                    if ui
+                        .small_button("Starter")
+                        .on_hover_text("Load Starter 10x10 Floor 1 factory (1 Mk-I Bot)")
+                        .clicked()
+                    {
+                        self.apply_factory_preset(
+                            GameState::new_starter_factory(),
+                            "Starter Factory (10x10 F1)",
+                        );
+                    }
+                    if ui
+                        .small_button("Multi-Floor")
+                        .on_hover_text("Load Multi-Floor 14x14 integrated B1-F3 factory (11 bots)")
+                        .clicked()
+                    {
+                        self.apply_factory_preset(
+                            GameState::new_multi_floor_factory(),
+                            "Multi-Floor Factory (14x14 F1)",
+                        );
+                    }
+                    if ui
+                        .small_button("Megafactory Stress")
+                        .on_hover_text("Load 26x26 Megafactory Stress Benchmark (23 bots, dual lines)")
+                        .clicked()
+                    {
+                        self.apply_factory_preset(
+                            GameState::new_megafactory_stress(),
+                            "Megafactory Stress (26x26 F1)",
+                        );
+                    }
+                });
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, SidebarTab::Robots, "Robots");
                     ui.selectable_value(&mut self.tab, SidebarTab::Modules, "Modules");
@@ -638,15 +787,18 @@ impl SwarmForgeApp {
         ] {
             let count = self.state.robots.iter().filter(|r| r.kind == kind).count() as u32;
             let cost = robot_current_cost(kind, count);
+            let tip = robot_stats_tooltip(kind);
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} (x{count})", kind.label())).strong());
+                    ui.label(RichText::new(format!("{} (x{count})", kind.label())).strong())
+                        .on_hover_text(&tip);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 self.state.credits >= cost,
                                 egui::Button::new(format!("Buy ({cost:.0} Cr)")),
                             )
+                            .on_hover_text(&tip)
                             .clicked()
                         {
                             match purchase_robot(&mut self.state, kind) {
@@ -659,7 +811,12 @@ impl SwarmForgeApp {
                         }
                     });
                 });
-                ui.small(format!("Assigned Floor: {}", kind.home_floor().title()));
+                ui.small(format!(
+                    "Floor: {} | Speed: {:.2} u/s | Draw: 0.65 kW",
+                    kind.home_floor().code(),
+                    kind.base_speed()
+                ))
+                .on_hover_text(tip);
             });
         }
     }
@@ -740,7 +897,7 @@ impl SwarmForgeApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!(
-                            "Click {} floor in 3D canvas to place {}",
+                            "Click {} floor to place {} (Shift+Click: continuous)",
                             armed.floor().code(),
                             armed.label()
                         ))
@@ -752,7 +909,7 @@ impl SwarmForgeApp {
                     }
                 });
             } else {
-                ui.small("Use '@(gx,gz)' for exact coordinates or 'Click' to place on the 3D floor.");
+                ui.small("Use '@(gx,gz)' for exact coordinates or 'Click Floor' (Shift+Click to repeat).");
             }
         });
 
@@ -804,6 +961,7 @@ impl SwarmForgeApp {
             let count = self.state.modules.iter().filter(|m| m.kind == kind).count() as u32;
             let cost = module_current_cost(kind, count);
             let has_room = count_open_spaced_slots(&self.state, kind.floor()) > 0;
+            let mod_tip = module_stats_tooltip(kind);
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -813,7 +971,8 @@ impl SwarmForgeApp {
                             kind.label()
                         ))
                         .strong(),
-                    );
+                    )
+                    .on_hover_text(&mod_tip);
                 });
                 ui.horizontal(|ui| {
                     let btn_lbl = if has_room {
@@ -884,7 +1043,7 @@ impl SwarmForgeApp {
                             self.state.credits >= cost,
                             egui::SelectableLabel::new(armed, "Click Floor"),
                         )
-                        .on_hover_text("Arm click-to-place on the 3D floor")
+                        .on_hover_text("Arm click-to-place on the 3D floor (hold Shift while clicking for continuous placement)")
                         .clicked()
                     {
                         if armed {
@@ -1182,16 +1341,27 @@ impl SwarmForgeApp {
 
             if response.clicked_by(egui::PointerButton::Primary) {
                 if let Some(kind) = self.placement_mode {
+                    let shift_held = ctx.input(|i| i.modifiers.shift);
                     if let Some((gx, gz)) = hover_cell {
                         match purchase_module_at(&mut self.state, kind, gx, gz) {
                             Ok(id) => {
-                                self.status_banner = format!(
-                                    "Placed {} #{id} at {} bay ({gx}, {gz}).",
-                                    kind.label(),
-                                    kind.floor().code()
-                                );
+                                self.status_banner = if shift_held {
+                                    format!(
+                                        "Placed {} #{id} at {} bay ({gx}, {gz}) [Shift held: click next bay].",
+                                        kind.label(),
+                                        kind.floor().code()
+                                    )
+                                } else {
+                                    format!(
+                                        "Placed {} #{id} at {} bay ({gx}, {gz}).",
+                                        kind.label(),
+                                        kind.floor().code()
+                                    )
+                                };
                                 self.selected_entity = Some(HitEntity::Module(id));
-                                self.placement_mode = None;
+                                if !shift_held {
+                                    self.placement_mode = None;
+                                }
                             }
                             Err(e) => {
                                 self.status_banner = e;
@@ -1400,6 +1570,68 @@ impl SwarmForgeApp {
             self.selected_entity = None;
         }
     }
+}
+
+fn robot_stats_tooltip(kind: RobotKind) -> String {
+    let role = match kind {
+        RobotKind::BasicWorker => "General-purpose F1 operator & hauler",
+        RobotKind::Assembler => "Dedicated station operator boosting assembly progress",
+        RobotKind::Hauler => "High-speed AGV moving parts between pipeline stages",
+        RobotKind::Builder => "Autonomous layout architect using A* corridor optimization",
+        RobotKind::RepairBot => "Emergency responder extinguishing hazards & repairing bots/fabs",
+        RobotKind::MotivationDrone => "Aerial CheerBot broadcasting +22% speed aura (R = 8.5u)",
+        RobotKind::Maintenance => "Basement utility rover restoring facility condition",
+        RobotKind::Researcher => "Floor 2 lab scientist synthesizing Research Points (RP)",
+        RobotKind::Administrator => "Floor 3 executive boosting contract & sale margins",
+    };
+    let aura_line = if kind == RobotKind::MotivationDrone {
+        format!("\nMorale Aura Radius: {:.1}u (+22% speed/work cadence)", CHEER_AURA_RADIUS)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}\nFloor: {} | Base Speed: {:.2} u/s | Draw: 0.65 kW | Base Cost: {:.0} Cr\nRole: {}{}",
+        kind.label(),
+        kind.home_floor().title(),
+        kind.base_speed(),
+        kind.base_cost(),
+        role,
+        aura_line
+    )
+}
+
+fn module_stats_tooltip(kind: ModuleKind) -> String {
+    let stage_desc = match kind.pipeline_stage() {
+        Some(s) => format!("Pipeline Stage {s}"),
+        None => "Support / Infrastructure".to_string(),
+    };
+    let kw = kind.power_draw_kw();
+    let power_desc = if kw < 0.0 {
+        format!("+{:.1} kW Supply", -kw)
+    } else {
+        format!("{:.1} kW Draw", kw)
+    };
+    let extra = match kind {
+        ModuleKind::FireSuppressionTower => {
+            format!("\nCryo-Foam Suppression Radius: {:.1}u (0.34/s per tower)", SUPPRESSION_RADIUS)
+        }
+        ModuleKind::BotRepairStation => {
+            "\nPit-Stop Tune-Up: +0.48/s integrity + 8s morale boost".to_string()
+        }
+        ModuleKind::DeliveryDock => {
+            "\nStage 5 Output Sink + Periodic Cargo Drone Sorties".to_string()
+        }
+        _ => String::new(),
+    };
+    format!(
+        "{}\nFloor: {} | {} | Power: {} | Base Cost: {:.0} Cr{}",
+        kind.label(),
+        kind.floor().title(),
+        stage_desc,
+        power_desc,
+        kind.base_cost(),
+        extra
+    )
 }
 
 fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
@@ -1685,22 +1917,32 @@ pub fn render_headless_screenshot(
 mod tests {
     use super::*;
 
-    fn run_frame_with_events(
+    fn run_frame_with_events_mod(
         ctx: &Context,
         app: &mut SwarmForgeApp,
         events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
     ) -> egui::FullOutput {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1600.0, 1000.0),
             )),
+            modifiers,
             events,
             ..Default::default()
         };
         ctx.run(raw, |c| {
             app.ui_step(c);
         })
+    }
+
+    fn run_frame_with_events(
+        ctx: &Context,
+        app: &mut SwarmForgeApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        run_frame_with_events_mod(ctx, app, events, egui::Modifiers::NONE)
     }
 
     fn key_press(key: egui::Key) -> egui::Event {
@@ -1868,5 +2110,128 @@ mod tests {
         let out_cleared = run_frame_with_events(&ctx, &mut app, vec![]);
         let joined_cleared = collect_texts(&out_cleared.shapes).join("\n");
         assert!(!joined_cleared.contains("[Morale]"));
+    }
+
+    #[test]
+    fn camera_pan_reset_speed_cycle_and_shift_continuous_placement() {
+        let mut state = GameState::new_starter_factory();
+        state.credits = 5000.0;
+        let ctx = Context::default();
+        let mut app = SwarmForgeApp::new_headless(state);
+
+        let _ = run_frame_with_events(&ctx, &mut app, vec![]);
+
+        let key_release = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // W/A/S/D panning & ] / [ speed cycling
+        let _ = run_frame_with_events(
+            &ctx,
+            &mut app,
+            vec![
+                key_press(egui::Key::W),
+                key_press(egui::Key::A),
+                key_press(egui::Key::CloseBracket),
+            ],
+        );
+        assert!(app.camera.pan_y > 0.0);
+        assert!(app.camera.pan_x > 0.0);
+        assert!((app.sim_speed - 2.0).abs() < 1e-4);
+
+        let _ = run_frame_with_events(
+            &ctx,
+            &mut app,
+            vec![
+                key_release(egui::Key::W),
+                key_release(egui::Key::A),
+                key_press(egui::Key::CloseBracket),
+            ],
+        );
+        assert!((app.sim_speed - 4.0).abs() < 1e-4);
+
+        let _ = run_frame_with_events(&ctx, &mut app, vec![key_press(egui::Key::OpenBracket)]);
+        assert!((app.sim_speed - 2.0).abs() < 1e-4);
+
+        // R resets IsoCamera
+        app.camera.yaw += 1.0;
+        app.camera.zoom = 40.0;
+        let _ = run_frame_with_events(&ctx, &mut app, vec![key_press(egui::Key::R)]);
+        assert!((app.camera.pan_x).abs() < 1e-4);
+        assert!((app.camera.pan_y).abs() < 1e-4);
+        assert!((app.camera.zoom - IsoCamera::default().zoom).abs() < 1e-4);
+
+        // Shift-click places a module and keeps placement_mode armed; normal click clears it
+        let mods_before = app.state.modules.len();
+        app.placement_mode = Some(ModuleKind::ProtoBench);
+        let approx_viewport =
+            egui::Rect::from_min_max(egui::pos2(396.0, 56.0), egui::pos2(1592.0, 944.0));
+        let (target_pt, _) = app.camera.project(
+            glam::Vec3::new(0.0, FloorId::MainFloor.world_y(), 0.0),
+            approx_viewport,
+            app.camera.active_focus_y(),
+        );
+        let shift_click = vec![
+            egui::Event::PointerMoved(target_pt),
+            egui::Event::PointerButton {
+                pos: target_pt,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+            egui::Event::PointerButton {
+                pos: target_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+        ];
+        let _ = run_frame_with_events_mod(&ctx, &mut app, shift_click, egui::Modifiers::SHIFT);
+        assert_eq!(app.state.modules.len(), mods_before + 1);
+        assert_eq!(
+            app.placement_mode,
+            Some(ModuleKind::ProtoBench),
+            "Shift-click should retain placement_mode for continuous placement"
+        );
+
+        let (second_pt, _) = app.camera.project(
+            glam::Vec3::new(-3.0 * crate::navigation::CELL_PITCH, FloorId::MainFloor.world_y(), 3.0 * crate::navigation::CELL_PITCH),
+            approx_viewport,
+            app.camera.active_focus_y(),
+        );
+        let normal_click = vec![
+            egui::Event::PointerMoved(second_pt),
+            egui::Event::PointerButton {
+                pos: second_pt,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: second_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let _ = run_frame_with_events(&ctx, &mut app, normal_click);
+        assert_eq!(app.state.modules.len(), mods_before + 2);
+        assert!(
+            app.placement_mode.is_none(),
+            "Normal click should clear placement_mode after placement"
+        );
+
+        // About shortcut cheat-sheet tab renders cleanly
+        app.show_about = true;
+        app.about_tab = AboutTab::Shortcuts;
+        let _ = run_frame_with_events(&ctx, &mut app, vec![]);
+        let out_sc = run_frame_with_events(&ctx, &mut app, vec![]);
+        let sc_text = collect_texts(&out_sc.shapes).join("\n");
+        assert!(sc_text.contains("Keyboard & Mouse Controls"));
+        assert!(sc_text.contains("Shift + Click"));
     }
 }

@@ -39,6 +39,7 @@ struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -47,14 +48,22 @@ fn vs_main(v: VertexInput, inst: InstanceInput) -> VertexOutput {
     let world_pos = v.pos * inst.scale + inst.offset;
     out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.color = inst.color;
-    out.normal = normalize(v.normal);
+    let safe_scale = max(abs(inst.scale), vec3<f32>(1e-4, 1e-4, 1e-4));
+    out.normal = normalize(v.normal / safe_scale);
+    out.world_pos = world_pos;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let ndotl = max(dot(in.normal, normalize(camera.sun_dir.xyz)), 0.0);
-    let hemi = 0.42 + 0.18 * in.normal.y;
-    let lit = in.color.rgb * (hemi + 0.62 * ndotl);
+    let n = normalize(in.normal);
+    let l = normalize(camera.sun_dir.xyz);
+    let ndotl = max(dot(n, l), 0.0);
+    let hemi = 0.42 + 0.18 * n.y;
+    let view_dir = normalize(vec3<f32>(0.57735, 0.57735, 0.57735));
+    let half_vec = normalize(l + view_dir);
+    let spec = pow(max(dot(n, half_vec), 0.0), 28.0) * 0.24;
+    let fresnel = pow(1.0 - max(dot(n, view_dir), 0.0), 3.0) * 0.16;
+    let lit = in.color.rgb * (hemi + 0.62 * ndotl) + vec3<f32>(spec + fresnel * 0.75, spec + fresnel * 0.90, spec + fresnel);
     return vec4<f32>(lit, in.color.a);
 }

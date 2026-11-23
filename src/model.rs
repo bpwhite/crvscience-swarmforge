@@ -25,6 +25,9 @@ fn default_one() -> f32 {
 fn default_tier_one() -> u8 {
     1
 }
+fn default_rng_seed() -> u64 {
+    0x5EED_F0E9_2026_1300
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FloorId {
@@ -519,6 +522,8 @@ pub struct GameState {
     pub admin_margin_multiplier: f32,
     pub builder_optimizations_done: u64,
     pub next_entity_id: u32,
+    #[serde(default = "default_rng_seed")]
+    pub rng_seed: u64,
     pub event_log: Vec<String>,
     #[serde(skip, default)]
     pub congestion_map: HashMap<(i32, i32), f32>,
@@ -632,6 +637,7 @@ impl GameState {
             admin_margin_multiplier: 1.0,
             builder_optimizations_done: 0,
             next_entity_id: next_id,
+            rng_seed: default_rng_seed(),
             event_log: vec![
                 "Facility online: 1 Mk-I Basic Bot active on 10x10 Floor 1.".to_string(),
                 "Disasters, Fire Suppression, Repair Bays, CheerBots & Drone Sorties enabled.".to_string(),
@@ -639,6 +645,160 @@ impl GameState {
             congestion_map: HashMap::new(),
             stuck_tracker: HashMap::new(),
         }
+    }
+
+    /// Multi-Floor Preset: 14x14 Floor 1 full Stage 0-5 line, safety/repair bay, F2 labs & F3 executive deck.
+    pub fn new_multi_floor_factory() -> Self {
+        let mut s = Self::new_starter_factory();
+        s.main_floor_half_extent = 7;
+        s.credits = 1_250.0;
+        s.research_points = 120.0;
+        s.active_product_tier = 2;
+        s.unlocked_techs = vec![
+            "swarm_stigmergy".to_string(),
+            "swarm_cnp_auction".to_string(),
+            "robo_servo_kinematics".to_string(),
+            "robo_modular_line".to_string(),
+        ];
+
+        let extra_mods = [
+            (ModuleKind::RawIntakeHopper, FloorId::MainFloor, -3, 3),
+            (ModuleKind::FabricationCell, FloorId::MainFloor, 0, -3),
+            (ModuleKind::SubAssemblyCell, FloorId::MainFloor, 0, 0),
+            (ModuleKind::FinalAssemblyCell, FloorId::MainFloor, 0, 3),
+            (ModuleKind::QualityPackagingBay, FloorId::MainFloor, 3, 0),
+            (ModuleKind::BotRepairStation, FloorId::MainFloor, -5, 0),
+            (ModuleKind::FireSuppressionTower, FloorId::MainFloor, 1, -5),
+            (ModuleKind::PowerSubstation, FloorId::Basement, -2, -2),
+            (ModuleKind::PlumbingChiller, FloorId::Basement, 2, 2),
+            (ModuleKind::MaterialsLabRig, FloorId::TechResearch, -2, 2),
+            (ModuleKind::HoloBlueprintBench, FloorId::TechResearch, 2, -2),
+            (ModuleKind::ContractDispatchTerminal, FloorId::Administration, -2, 2),
+        ];
+        for (kind, floor, gx, gz) in extra_mods {
+            let id = s.alloc_id();
+            s.modules.push(FactoryModule::new(id, kind, floor, gx, gz));
+        }
+
+        let extra_bots = [
+            (RobotKind::Assembler, FloorId::MainFloor, -1.5, 1.5),
+            (RobotKind::Assembler, FloorId::MainFloor, 1.5, -1.5),
+            (RobotKind::Hauler, FloorId::MainFloor, 1.5, 1.5),
+            (RobotKind::Hauler, FloorId::MainFloor, -1.5, -1.5),
+            (RobotKind::Builder, FloorId::MainFloor, -4.5, 2.0),
+            (RobotKind::RepairBot, FloorId::MainFloor, -4.0, -2.0),
+            (RobotKind::MotivationDrone, FloorId::MainFloor, 0.0, 0.0),
+            (RobotKind::Maintenance, FloorId::Basement, 0.0, 0.0),
+            (RobotKind::Researcher, FloorId::TechResearch, 0.0, 1.5),
+            (RobotKind::Administrator, FloorId::Administration, 1.5, 0.0),
+        ];
+        for (kind, floor, x, z) in extra_bots {
+            let id = s.alloc_id();
+            s.robots.push(Robot {
+                id,
+                kind,
+                floor,
+                x,
+                z,
+                target_x: x,
+                target_z: z,
+                heading: 0.0,
+                tier: 1,
+                energy: 1.0,
+                integrity: 1.0,
+                morale_boost_timer: 0.0,
+                task: RobotTask::Idle,
+                tasks_completed: 0,
+            });
+        }
+        s.warehouse_flare_tier = 3;
+        s.event_log.clear();
+        s.push_log("Preset loaded: Multi-Floor Industrial Integration (14x14 F1, 11 bots).");
+        s
+    }
+
+    /// Megafactory Stress Preset: Full 26x26 Floor 1 slab, redundant lines, 20-bot swarm & F1-F3 tech.
+    pub fn new_megafactory_stress() -> Self {
+        let mut s = Self::new_multi_floor_factory();
+        s.main_floor_half_extent = 13;
+        s.credits = 6_500.0;
+        s.research_points = 420.0;
+        s.raw_material_stock = 320.0;
+        s.active_product_tier = 4;
+        s.unlocked_techs = vec![
+            "swarm_stigmergy".to_string(),
+            "swarm_cnp_auction".to_string(),
+            "swarm_peloton".to_string(),
+            "swarm_multi_arm".to_string(),
+            "swarm_aco_layout".to_string(),
+            "robo_servo_kinematics".to_string(),
+            "robo_modular_line".to_string(),
+            "robo_basement_hv".to_string(),
+            "robo_floor2_labs".to_string(),
+            "robo_floor3_admin".to_string(),
+            "robo_bay_expansion".to_string(),
+        ];
+
+        let mega_mods = [
+            (ModuleKind::RawIntakeHopper, FloorId::MainFloor, -9, -6),
+            (ModuleKind::FabricationCell, FloorId::MainFloor, -6, -6),
+            (ModuleKind::FabricationCell, FloorId::MainFloor, -6, 6),
+            (ModuleKind::SubAssemblyCell, FloorId::MainFloor, -3, 6),
+            (ModuleKind::FinalAssemblyCell, FloorId::MainFloor, 6, -3),
+            (ModuleKind::FinalAssemblyCell, FloorId::MainFloor, 6, 3),
+            (ModuleKind::QualityPackagingBay, FloorId::MainFloor, 9, 0),
+            (ModuleKind::DeliveryDock, FloorId::MainFloor, 9, 6),
+            (ModuleKind::FireSuppressionTower, FloorId::MainFloor, -6, 0),
+            (ModuleKind::FireSuppressionTower, FloorId::MainFloor, 6, -6),
+            (ModuleKind::BotRepairStation, FloorId::MainFloor, 6, 6),
+            (ModuleKind::PowerSubstation, FloorId::Basement, -3, -3),
+            (ModuleKind::PowerSubstation, FloorId::Basement, 3, -3),
+            (ModuleKind::StorageSilo, FloorId::Basement, 0, -3),
+            (ModuleKind::MaintenanceBay, FloorId::Basement, -3, 3),
+            (ModuleKind::SupplyHedgeServer, FloorId::Administration, 2, -2),
+        ];
+        for (kind, floor, gx, gz) in mega_mods {
+            let id = s.alloc_id();
+            s.modules.push(FactoryModule::new(id, kind, floor, gx, gz));
+        }
+
+        let mega_bots = [
+            (RobotKind::Assembler, FloorId::MainFloor, -7.0, -3.0),
+            (RobotKind::Assembler, FloorId::MainFloor, 5.0, -1.0),
+            (RobotKind::Assembler, FloorId::MainFloor, 5.0, 5.0),
+            (RobotKind::Hauler, FloorId::MainFloor, -5.0, 4.0),
+            (RobotKind::Hauler, FloorId::MainFloor, 4.0, -4.0),
+            (RobotKind::Hauler, FloorId::MainFloor, 7.0, 2.0),
+            (RobotKind::Builder, FloorId::MainFloor, 0.0, -7.0),
+            (RobotKind::RepairBot, FloorId::MainFloor, 5.0, -5.0),
+            (RobotKind::MotivationDrone, FloorId::MainFloor, 6.0, 0.0),
+            (RobotKind::Maintenance, FloorId::Basement, -2.0, 1.5),
+            (RobotKind::Researcher, FloorId::TechResearch, -1.5, -1.5),
+            (RobotKind::Administrator, FloorId::Administration, -1.5, 0.0),
+        ];
+        for (kind, floor, x, z) in mega_bots {
+            let id = s.alloc_id();
+            s.robots.push(Robot {
+                id,
+                kind,
+                floor,
+                x,
+                z,
+                target_x: x,
+                target_z: z,
+                heading: 0.0,
+                tier: 2,
+                energy: 1.0,
+                integrity: 1.0,
+                morale_boost_timer: 0.0,
+                task: RobotTask::Idle,
+                tasks_completed: 0,
+            });
+        }
+        s.warehouse_flare_tier = 5;
+        s.event_log.clear();
+        s.push_log("Preset loaded: Megafactory Stress Benchmark (26x26 F1, 23 bots).");
+        s
     }
 
     pub fn alloc_id(&mut self) -> u32 {

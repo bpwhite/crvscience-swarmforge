@@ -324,6 +324,15 @@ impl PartialOrd for AStarNode {
     }
 }
 
+/// Exact admissible octile heuristic on 8-connected grids (cardinal cost = 10, diagonal = 14).
+#[inline]
+fn octile_heuristic(ax: i32, az: i32, bx: i32, bz: i32) -> i32 {
+    let dx = (ax - bx).abs();
+    let dz = (az - bz).abs();
+    let (hi, lo) = if dx >= dz { (dx, dz) } else { (dz, dx) };
+    10 * hi + 4 * lo
+}
+
 pub fn astar_corridor_cost(
     modules: &[FactoryModule],
     congestion: &HashMap<(i32, i32), f32>,
@@ -350,7 +359,7 @@ pub fn astar_corridor_cost(
     let mut g_map: HashMap<(i32, i32), i32> = HashMap::new();
     let mut came_from: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
 
-    let h = |x: i32, z: i32| -> i32 { ((x - goal.0).abs() + (z - goal.1).abs()) * 10 };
+    let h = |x: i32, z: i32| -> i32 { octile_heuristic(x, z, goal.0, goal.1) };
     g_map.insert(start, 0);
     open.push(AStarNode {
         f_cost: h(start.0, start.1),
@@ -477,7 +486,7 @@ fn fine_next_waypoint(
     let mut open = BinaryHeap::new();
     let mut g_map: HashMap<(i32, i32), i32> = HashMap::new();
     let mut came_from: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
-    let h = |x: i32, z: i32| -> i32 { ((x - goal.0).abs() + (z - goal.1).abs()) * 10 };
+    let h = |x: i32, z: i32| -> i32 { octile_heuristic(x, z, goal.0, goal.1) };
 
     g_map.insert(start, 0);
     open.push(AStarNode {
@@ -991,5 +1000,18 @@ mod tests {
             bot.x,
             bot.z
         );
+    }
+
+    #[test]
+    fn astar_corridor_cost_uses_exact_admissible_octile_metric() {
+        let congestion = HashMap::new();
+        let (cost, path) = astar_corridor_cost(&[], &congestion, FloorId::MainFloor, 5, (0, 0), (4, 4));
+        assert!(
+            (cost - 5.6).abs() < 1e-5,
+            "Expected exact octile diagonal cost 5.6, got {cost}"
+        );
+        assert_eq!(path.len(), 5, "Expected 5-cell diagonal path: {path:?}");
+        assert_eq!(path.first().copied(), Some((0, 0)));
+        assert_eq!(path.last().copied(), Some((4, 4)));
     }
 }

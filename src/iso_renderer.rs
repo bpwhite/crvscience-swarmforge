@@ -15,8 +15,11 @@
 
 #![forbid(unsafe_code)]
 
-use crate::model::{FloorId, GameState, Robot, RobotTask};
-use crate::models_3d::{build_module_parts, build_robot_parts, BoxPart};
+use crate::disasters::{CHEER_AURA_RADIUS, SUPPRESSION_RADIUS};
+use crate::model::{FloorId, GameState, ModuleKind, Robot, RobotKind, RobotTask};
+use crate::models_3d::{
+    build_module_parts, build_robot_parts, delivery_dock_drone_offset, BoxPart,
+};
 use crate::navigation::CELL_PITCH;
 use egui::{Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 use glam::{Mat4, Quat, Vec3, Vec4};
@@ -66,6 +69,9 @@ pub struct IsoCamera {
     pub pan_x: f32,
     pub pan_y: f32,
     pub view_mode: FloorViewMode,
+    pub show_suppression_overlay: bool,
+    pub show_cheer_overlay: bool,
+    pub show_congestion_overlay: bool,
 }
 
 impl Default for IsoCamera {
@@ -77,6 +83,9 @@ impl Default for IsoCamera {
             pan_x: 0.0,
             pan_y: 0.0,
             view_mode: FloorViewMode::Single(FloorId::MainFloor),
+            show_suppression_overlay: true,
+            show_cheer_overlay: true,
+            show_congestion_overlay: true,
         }
     }
 }
@@ -89,6 +98,27 @@ struct ProjectedQuad {
 }
 
 impl IsoCamera {
+    /// Reset camera yaw, pitch, zoom, pan, and floor view to isometric defaults while preserving overlay toggles.
+    pub fn reset_view(&mut self) {
+        let def = Self::default();
+        self.yaw = def.yaw;
+        self.pitch = def.pitch;
+        self.zoom = def.zoom;
+        self.pan_x = def.pan_x;
+        self.pan_y = def.pan_y;
+        self.view_mode = def.view_mode;
+    }
+
+    pub fn eye_direction(&self) -> Vec3 {
+        let cp = self.pitch.cos();
+        Vec3::new(
+            self.yaw.cos() * cp,
+            self.pitch.sin(),
+            self.yaw.sin() * cp,
+        )
+        .normalize()
+    }
+
     pub fn active_focus_y(&self) -> f32 {
         match self.view_mode {
             FloorViewMode::Single(f) => f.world_y(),
@@ -420,6 +450,106 @@ pub fn render_isometric_factory_interactive(
                     painter.line_segment(
                         [p1, p2],
                         Stroke::new(2.2_f32, Color32::from_rgba_unmultiplied(40, 235, 220, alpha)),
+                    );
+                }
+            }
+
+            if cam.show_congestion_overlay {
+                for (&(gx, gz), &heat) in &state.congestion_map {
+                    if heat <= 0.05 || gx < -half_cells || gx >= half_cells || gz < -half_cells || gz >= half_cells {
+                        continue;
+                    }
+                    let wx = gx as f32 * CELL_PITCH;
+                    let wz = gz as f32 * CELL_PITCH;
+                    let e = 0.45 * CELL_PITCH;
+                    let t = (heat / 2.5).clamp(0.0, 1.0);
+                    let alpha = (40.0 + 115.0 * t) as u8;
+                    let fill = Color32::from_rgba_unmultiplied(
+                        245,
+                        (180.0 - 115.0 * t) as u8,
+                        35,
+                        alpha,
+                    );
+                    let pts = vec![
+                        cam.project(Vec3::new(wx - e, fy + 0.02, wz - e), rect, focus_y).0,
+                        cam.project(Vec3::new(wx + e, fy + 0.02, wz - e), rect, focus_y).0,
+                        cam.project(Vec3::new(wx + e, fy + 0.02, wz + e), rect, focus_y).0,
+                        cam.project(Vec3::new(wx - e, fy + 0.02, wz + e), rect, focus_y).0,
+                    ];
+                    painter.add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+                }
+            }
+
+            if cam.show_suppression_overlay {
+                let ring_stroke = Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(56, 220, 255, 130));
+                for m in state.modules.iter().filter(|m| {
+                    m.floor == FloorId::MainFloor && m.kind == ModuleKind::FireSuppressionTower
+                }) {
+                    draw_floor_circle_ring(
+                        painter,
+                        cam,
+                        rect,
+                        focus_y,
+                        m.visual_x,
+                        fy + 0.03,
+                        m.visual_z,
+                        SUPPRESSION_RADIUS,
+                        ring_stroke,
+                        28,
+                    );
+                }
+            }
+
+            if cam.show_cheer_overlay {
+                let ring_stroke = Stroke::new(1.4_f32, Color32::from_rgba_unmultiplied(250, 204, 21, 135));
+                for r in state.robots.iter().filter(|r| {
+                    r.floor == FloorId::MainFloor && r.kind == RobotKind::MotivationDrone
+                }) {
+                    draw_floor_circle_ring(
+                        painter,
+                        cam,
+                        rect,
+                        focus_y,
+                        r.x,
+                        fy + 0.03,
+                        r.z,
+                        CHEER_AURA_RADIUS,
+                        ring_stroke,
+                        24,
+                    );
+                }
+            }
+
+            // Ground contact shadows beneath aerial MotivationDrones and DeliveryDock cargo drones
+            for r in state.robots.iter().filter(|r| {
+                r.floor == FloorId::MainFloor && r.kind == RobotKind::MotivationDrone
+            }) {
+                let phase = time_s * 5.5 + (r.id as f32) * 1.37;
+                let alt = 2.55 + (phase * 0.9).sin() * 0.14;
+                draw_drone_ground_shadow(painter, cam, rect, focus_y, r.x, fy, r.z, alt, 0.42);
+            }
+            for m in state.modules.iter().filter(|m| {
+                m.floor == FloorId::MainFloor && m.kind == ModuleKind::DeliveryDock
+            }) {
+                let lift_y = if m.being_relocated {
+                    0.52 + (time_s * 7.0).sin() * 0.06
+                } else {
+                    0.0
+                };
+                let drone_offset = delivery_dock_drone_offset(m.drone_sortie_progress, time_s);
+                let sx = m.visual_x + drone_offset.x;
+                let sz = m.visual_z + drone_offset.z;
+                if sx.abs() <= half + 1.5 && sz.abs() <= half + 1.5 {
+                    draw_drone_ground_shadow(
+                        painter,
+                        cam,
+                        rect,
+                        focus_y,
+                        sx,
+                        fy,
+                        sz,
+                        lift_y + drone_offset.y,
+                        0.48,
                     );
                 }
             }
@@ -768,7 +898,96 @@ pub fn render_isometric_factory_interactive(
         }
     }
 
+    draw_compass_triad(painter, &view, rect);
     pick_result
+}
+
+fn draw_floor_circle_ring(
+    painter: &Painter,
+    cam: &IsoCamera,
+    rect: Rect,
+    focus_y: f32,
+    cx: f32,
+    fy: f32,
+    cz: f32,
+    radius: f32,
+    stroke: Stroke,
+    segments: usize,
+) {
+    let mut prev: Option<Pos2> = None;
+    for i in 0..=segments {
+        let ang = (i as f32 / segments as f32) * std::f32::consts::TAU;
+        let p = Vec3::new(cx + ang.cos() * radius, fy, cz + ang.sin() * radius);
+        let (sp, _) = cam.project(p, rect, focus_y);
+        if let Some(p0) = prev {
+            if i % 2 == 1 {
+                painter.line_segment([p0, sp], stroke);
+            }
+        }
+        prev = Some(sp);
+    }
+}
+
+fn draw_drone_ground_shadow(
+    painter: &Painter,
+    cam: &IsoCamera,
+    rect: Rect,
+    focus_y: f32,
+    x: f32,
+    fy: f32,
+    z: f32,
+    alt_agl: f32,
+    radius_base: f32,
+) {
+    let rad = (radius_base - alt_agl * 0.02).max(0.18);
+    let alpha = (135.0 / (1.0 + alt_agl.max(0.0) * 0.22)).clamp(28.0, 140.0) as u8;
+    let fill = Color32::from_rgba_unmultiplied(6, 10, 18, alpha);
+    let mut pts = Vec::with_capacity(10);
+    for i in 0..10 {
+        let ang = (i as f32 / 10.0) * std::f32::consts::TAU;
+        let (sp, _) = cam.project(
+            Vec3::new(x + ang.cos() * rad, fy + 0.025, z + ang.sin() * rad),
+            rect,
+            focus_y,
+        );
+        pts.push(sp);
+    }
+    painter.add(Shape::convex_polygon(pts, fill, Stroke::NONE));
+
+    if alt_agl > 0.8 {
+        let (ground_pt, _) = cam.project(Vec3::new(x, fy + 0.03, z), rect, focus_y);
+        let (air_pt, _) = cam.project(Vec3::new(x, fy + alt_agl - 0.15, z), rect, focus_y);
+        painter.line_segment(
+            [ground_pt, air_pt],
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 195, 240, 55)),
+        );
+    }
+}
+
+fn draw_compass_triad(painter: &Painter, view: &Mat4, rect: Rect) {
+    if rect.width() < 120.0 || rect.height() < 120.0 {
+        return;
+    }
+    let origin = Pos2::new(rect.left() + 44.0, rect.bottom() - 44.0);
+    let len = 24.0f32;
+    let mut axes = [
+        (Vec3::X, "X", Color32::from_rgb(248, 113, 113)),
+        (Vec3::Y, "Y", Color32::from_rgb(74, 222, 128)),
+        (Vec3::Z, "Z", Color32::from_rgb(56, 189, 248)),
+    ];
+    axes.sort_by(|a, b| {
+        let za = view.transform_vector3(a.0).z;
+        let zb = view.transform_vector3(b.0).z;
+        za.partial_cmp(&zb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (dir, label, col) in axes {
+        let v = view.transform_vector3(dir);
+        let tip = Pos2::new(origin.x + v.x * len, origin.y - v.y * len);
+        painter.line_segment([origin, tip], Stroke::new(2.0_f32, col));
+        let lbl_pos = Pos2::new(origin.x + v.x * (len + 9.0), origin.y - v.y * (len + 9.0));
+        painter.text(lbl_pos, Align2::CENTER_CENTER, label, FontId::proportional(10.5), col);
+    }
+    painter.circle_filled(origin, 2.5, Color32::from_rgb(226, 232, 240));
 }
 
 fn emit_oriented_box(
@@ -823,11 +1042,15 @@ fn emit_oriented_box(
             pts[k] = sp;
             z_sum += vz;
         }
+        let view_dir = cam.eye_direction();
+        let half_vec = (sun_dir + view_dir).normalize();
         let ndotl = world_n.dot(sun_dir).max(0.0);
+        let spec = world_n.dot(half_vec).max(0.0).powi(24) * 0.16;
+        let fresnel = (1.0 - world_n.dot(view_dir).max(0.0)).powi(3) * 0.10;
         let shade = 0.48 + 0.14 * world_n.y + 0.56 * ndotl;
-        let r = ((part.rgb[0] as f32) * shade).clamp(0.0, 255.0) as u8;
-        let g = ((part.rgb[1] as f32) * shade).clamp(0.0, 255.0) as u8;
-        let b = ((part.rgb[2] as f32) * shade).clamp(0.0, 255.0) as u8;
+        let r = ((part.rgb[0] as f32) * shade + 255.0 * (spec + fresnel * 0.7)).clamp(0.0, 255.0) as u8;
+        let g = ((part.rgb[1] as f32) * shade + 255.0 * (spec + fresnel * 0.85)).clamp(0.0, 255.0) as u8;
+        let b = ((part.rgb[2] as f32) * shade + 255.0 * (spec + fresnel)).clamp(0.0, 255.0) as u8;
         let color = if alpha == 255 {
             Color32::from_rgb(r, g, b)
         } else {
@@ -1012,6 +1235,36 @@ mod tests {
                 cam_single.floor_render_y(FloorId::MainFloor)
             ),
             Some((2, -1))
+        );
+    }
+
+    #[test]
+    fn renders_drone_shadows_aura_rings_congestion_tiles_and_compass_triad() {
+        let mut state = GameState::new_multi_floor_factory();
+        state.congestion_map.insert((0, 1), 1.8);
+
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let cam = IsoCamera::default();
+
+        let full = ctx.run(egui::RawInput::default(), |c| {
+            let painter = Painter::new(c.clone(), LayerId::new(Order::Middle, egui::Id::new("ovr")), rect);
+            render_isometric_factory(&painter, rect, &state, &cam);
+        });
+
+        let has_compass_x = full.shapes.iter().any(|cs| {
+            matches!(&cs.shape, Shape::Text(ts) if ts.galley.text() == "X")
+        });
+        assert!(has_compass_x, "Expected 3D compass triad axis label 'X'");
+
+        let polygon_count = full
+            .shapes
+            .iter()
+            .filter(|cs| matches!(&cs.shape, Shape::Path(_)))
+            .count();
+        assert!(
+            polygon_count >= 3,
+            "Expected drone contact shadows + congestion heat tile polygons (got {polygon_count})"
         );
     }
 }

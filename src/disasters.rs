@@ -22,13 +22,28 @@ use crate::model::{
 };
 use crate::navigation::{module_dock_point, step_robot_with_collision};
 use crate::swarm_tech::compute_multipliers;
-use rand::Rng;
 
 /// Coverage radius (in world units) of each `FireSuppressionTower`.
 pub const SUPPRESSION_RADIUS: f32 = 10.5;
 
 /// Morale aura radius (in world units) of each cheering `MotivationDrone`.
 pub const CHEER_AURA_RADIUS: f32 = 8.5;
+
+/// Advances deterministic SplitMix64 state on `GameState` and returns 64 pseudo-random bits.
+#[inline]
+fn next_rng_u64(state: &mut GameState) -> u64 {
+    state.rng_seed = state.rng_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = state.rng_seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic uniform float in `[0.0, 1.0)` derived from `GameState::rng_seed`.
+#[inline]
+fn next_rng_f32(state: &mut GameState) -> f32 {
+    ((next_rng_u64(state) >> 40) as f32) / ((1u32 << 24) as f32)
+}
 
 /// Computes the non-obstructing Warehouse Flare Tier (`1..=6`) from cumulative factory growth.
 pub fn compute_warehouse_flare_tier(state: &GameState) -> u8 {
@@ -63,12 +78,12 @@ pub fn tick_disasters_repair_and_drones(state: &mut GameState, dt: f32) {
         }
     }
 
-    // 2. Stochastic Disaster Spawning (scaled gently so 1-bot starter factories aren't overwhelmed)
-    if state.elapsed_secs > 22.0 && state.disasters.len() < 3 && state.tick_count % 25 == 0 {
+    // 2. Continuous-Time Deterministic Poisson Disaster Spawning
+    if state.elapsed_secs > 22.0 && state.disasters.len() < 3 {
         let overload_ratio = (state.power_demand_kw / state.power_supply_kw.max(1.0)).max(0.5);
-        let base_chance = 0.012 * overload_ratio * (1.0 + state.modules.len() as f32 * 0.025);
-        let mut rng = rand::thread_rng();
-        if rng.gen::<f32>() < base_chance {
+        let lambda = 0.0048 * overload_ratio * (1.0 + state.modules.len() as f32 * 0.025);
+        let p_trigger = 1.0 - (-lambda * dt).exp();
+        if next_rng_f32(state) < p_trigger {
             spawn_random_disaster(state);
         }
     }
@@ -106,8 +121,8 @@ pub fn tick_disasters_repair_and_drones(state: &mut GameState, dt: f32) {
             if tower_suppression > 0.0 {
                 d.severity -= tower_suppression * dt;
             } else {
-                // Slow natural self-burnout or slight growth up to 1.0
-                d.severity = (d.severity - 0.015 * dt).clamp(0.0, 1.0);
+                // Unsuppressed disasters escalate over time toward maximum severity (1.0)
+                d.severity = (d.severity + 0.028 * dt).clamp(0.0, 1.0);
             }
             if d.severity <= 0.02 {
                 resolved_logs.push(format!(
@@ -444,12 +459,12 @@ pub fn spawn_random_disaster(state: &mut GameState) {
     if candidates.is_empty() {
         return;
     }
-    let mut rng = rand::thread_rng();
-    let (mid, floor, x, z, mkind) = candidates[rng.gen_range(0..candidates.len())];
-    let kind = if state.power_demand_kw > state.power_supply_kw && rng.gen_bool(0.55) {
+    let pick_idx = (next_rng_u64(state) as usize) % candidates.len();
+    let (mid, floor, x, z, mkind) = candidates[pick_idx];
+    let kind = if state.power_demand_kw > state.power_supply_kw && next_rng_f32(state) < 0.55 {
         DisasterKind::GridOverload
     } else {
-        match rng.gen_range(0..4) {
+        match (next_rng_u64(state) % 4) as u8 {
             0 => DisasterKind::ThermalFire,
             1 => DisasterKind::GridOverload,
             2 => DisasterKind::CoolantLeak,
@@ -545,6 +560,57 @@ mod tests {
         assert!(
             state.robots[0].morale_boost_timer > 0.0,
             "MotivationDrone should apply morale cadence buff to nearby worker!"
+        );
+    }
+
+    #[test]
+    fn deterministic_seeded_poisson_disasters_and_unsuppressed_fire_escalation() {
+        let mut a = GameState::new_starter_factory();
+        a.elapsed_secs = 30.0;
+        a.power_demand_kw = 250.0; // elevate hazard rate so Poisson triggers occur within test window
+        a.power_supply_kw = 25.0;
+        a.rng_seed = 0x1234_5678_9ABC_DEF0;
+
+        let mut b = a.clone();
+
+        for i in 0..400 {
+            a.tick_count = i;
+            b.tick_count = i;
+            tick_disasters_repair_and_drones(&mut a, 0.1);
+            tick_disasters_repair_and_drones(&mut b, 0.1);
+        }
+
+        assert!(
+            !a.disasters.is_empty(),
+            "Expected Poisson hazard rate to spawn at least one disaster under 10x overload"
+        );
+        assert_eq!(a.rng_seed, b.rng_seed, "PRNG state must be strictly deterministic");
+        assert_eq!(a.disasters.len(), b.disasters.len());
+        for (da, db) in a.disasters.iter().zip(b.disasters.iter()) {
+            assert_eq!(da.kind, db.kind);
+            assert_eq!(da.module_id, db.module_id);
+        }
+
+        // Verify unsuppressed fire escalates over time toward 1.0 instead of decaying
+        let mut esc = GameState::new_starter_factory();
+        esc.elapsed_secs = 0.0; // suppress random spawns while testing escalation
+        esc.disasters.push(ActiveDisaster {
+            id: 777,
+            kind: DisasterKind::ThermalFire,
+            floor: FloorId::MainFloor,
+            module_id: 2,
+            x: 7.2,
+            z: -7.2,
+            severity: 0.50,
+            suppressed_by_tower: false,
+        });
+        for _ in 0..50 {
+            tick_disasters_repair_and_drones(&mut esc, 0.1);
+        }
+        let final_sev = esc.disasters[0].severity;
+        assert!(
+            final_sev > 0.60 && final_sev <= 1.0,
+            "Unsuppressed fire must escalate above 0.50 (got {final_sev})"
         );
     }
 }
