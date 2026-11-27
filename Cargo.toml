@@ -5,6 +5,9 @@ edition = "2021"
 authors = ["Bryan P. White <crvscience.com>"]
 description = "SwarmForge: 3D Isometric Automated Robotic Factory & Swarm Intelligence Simulation Game"
 license = "GPL-3.0-or-later"
+homepage = "https://crvscience.com/apps"
+repository = "https://github.com/bpwhite/crvscience-swarmforge"
+readme = "README.md"
 
 [dependencies]
 eframe = { version = "0.31", features = ["wgpu"] }
