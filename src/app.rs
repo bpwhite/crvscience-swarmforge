@@ -30,7 +30,10 @@ use crate::model::{
     PRODUCT_CATALOG,
 };
 use crate::navigation::enforce_spacing_and_migrate;
-use crate::persistence::{export_json_file, import_json_file, SaveSlotSummary, SaveStore};
+use crate::persistence::{
+    export_json_file, export_kpi_digest_csv, export_kpi_digest_json, import_json_file,
+    SaveSlotSummary, SaveStore,
+};
 use crate::swarm_tech::{can_unlock_tech, unlock_tech, TechBranch, TECH_TREE};
 use egui::{Color32, Context, RichText, ScrollArea, Sense};
 use std::path::PathBuf;
@@ -67,6 +70,8 @@ pub struct SwarmForgeApp {
     status_banner: String,
     persistence_msg: Option<(bool, String)>,
     show_about: bool,
+    show_command_palette: bool,
+    palette_query: String,
     event_log_expanded: bool,
     last_hits: Vec<HitBox>,
     selected_entity: Option<HitEntity>,
@@ -107,6 +112,8 @@ impl SwarmForgeApp {
             status_banner,
             persistence_msg: None,
             show_about: false,
+            show_command_palette: false,
+            palette_query: String::new(),
             event_log_expanded: false,
             last_hits: Vec::new(),
             selected_entity: None,
@@ -138,6 +145,8 @@ impl SwarmForgeApp {
                 .to_string(),
             persistence_msg: None,
             show_about: false,
+            show_command_palette: false,
+            palette_query: String::new(),
             event_log_expanded: false,
             last_hits: Vec::new(),
             selected_entity: None,
@@ -287,11 +296,16 @@ impl SwarmForgeApp {
 
         let wants_kb = ctx.wants_keyboard_input();
         ctx.input(|i| {
+            if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::K) {
+                self.show_command_palette = !self.show_command_palette;
+            }
             if i.key_pressed(egui::Key::F1) {
                 self.show_about = !self.show_about;
             }
             if i.key_pressed(egui::Key::Escape) {
-                if self.show_about {
+                if self.show_command_palette {
+                    self.show_command_palette = false;
+                } else if self.show_about {
                     self.show_about = false;
                 } else if self.placement_mode.is_some() {
                     self.placement_mode = None;
@@ -356,6 +370,7 @@ impl SwarmForgeApp {
         self.draw_bottom_log(ctx);
         self.draw_left_command_dock(ctx);
         self.draw_central_viewport(ctx);
+        self.draw_command_palette(ctx);
         self.draw_about_window(ctx);
 
         ctx.request_repaint();
@@ -430,6 +445,12 @@ impl SwarmForgeApp {
                 ui.label(format!("Flare T{}", self.state.warehouse_flare_tier))
                     .on_hover_text("Facility scale & logistics flare tier driving delivery volume and drone fleet activity");
                 ui.separator();
+                if ui
+                    .selectable_label(self.show_command_palette, "Ctrl+K Palette")
+                    .clicked()
+                {
+                    self.show_command_palette = !self.show_command_palette;
+                }
                 if ui.button("About").clicked() {
                     self.show_about = !self.show_about;
                 }
@@ -634,6 +655,217 @@ impl SwarmForgeApp {
                 });
             });
         });
+    }
+
+    fn draw_command_palette(&mut self, ctx: &Context) {
+        if !self.show_command_palette {
+            return;
+        }
+        let mut open = self.show_command_palette;
+        let mut preset_choice: Option<(&'static str, GameState)> = None;
+        let mut floor_choice: Option<FloorViewMode> = None;
+        let mut toggle_cryo = false;
+        let mut toggle_cheer = false;
+        let mut toggle_heat = false;
+        let mut speed_choice: Option<f32> = None;
+        let mut toggle_pause = false;
+        let mut reset_cam = false;
+        let mut export_kpi_json = false;
+        let mut export_kpi_csv = false;
+        let mut export_state_json = false;
+
+        egui::Window::new("SwarmForge Command Palette (Ctrl+K)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
+            .show(ctx, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_query)
+                        .id_salt("swarmforge_palette_input")
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Jump across blueprints, floors, swarm overlays, speed presets, or KPI exports..."),
+                );
+                resp.request_focus();
+                ui.separator();
+                let q = self.palette_query.trim().to_ascii_lowercase();
+                let matches = |hay: &str| -> bool {
+                    q.is_empty()
+                        || q.split_whitespace()
+                            .all(|tok| hay.to_ascii_lowercase().contains(tok))
+                };
+
+                ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                    if matches("blueprint starter factory 10x10")
+                        && ui.button("[Blueprint] Starter Factory (10x10 F1)").clicked()
+                    {
+                        preset_choice = Some(("Starter Factory (10x10 F1)", GameState::new_starter_factory()));
+                    }
+                    if matches("blueprint multi-floor integrated 14x14 b1 f3")
+                        && ui.button("[Blueprint] Multi-Floor Integrated Factory (14x14 F1)").clicked()
+                    {
+                        preset_choice = Some(("Multi-Floor Factory (14x14 F1)", GameState::new_multi_floor_factory()));
+                    }
+                    if matches("blueprint megafactory stress benchmark 26x26")
+                        && ui.button("[Blueprint] Megafactory Stress Benchmark (26x26 F1)").clicked()
+                    {
+                        preset_choice = Some(("Megafactory Stress (26x26 F1)", GameState::new_megafactory_stress()));
+                    }
+
+                    ui.separator();
+                    for (mode, lbl) in [
+                        (FloorViewMode::Single(FloorId::Basement), "Floor B1: Utility Grid & Piping (1)"),
+                        (FloorViewMode::Single(FloorId::MainFloor), "Floor F1: Main Robotic Assembly (2)"),
+                        (FloorViewMode::Single(FloorId::TechResearch), "Floor F2: Tech & Swarm Research (3)"),
+                        (FloorViewMode::Single(FloorId::Administration), "Floor F3: Robotic Administration (4)"),
+                        (FloorViewMode::AllFloorsCutaway, "4-Floor Translucent Cutaway View (0)"),
+                    ] {
+                        if matches(lbl)
+                            && ui
+                                .selectable_label(self.camera.view_mode == mode, format!("[View] {lbl}"))
+                                .clicked()
+                        {
+                            floor_choice = Some(mode);
+                        }
+                    }
+                    if matches("reset camera isometric view r")
+                        && ui.button("[View] Reset Isometric Camera (R)").clicked()
+                    {
+                        reset_cam = true;
+                    }
+
+                    ui.separator();
+                    if matches("overlay cryo suppression tower rings")
+                        && ui
+                            .selectable_label(
+                                self.camera.show_suppression_overlay,
+                                "[Overlay] Toggle Cryo-Foam Suppression Rings",
+                            )
+                            .clicked()
+                    {
+                        toggle_cryo = true;
+                    }
+                    if matches("overlay cheer morale drone aura rings")
+                        && ui
+                            .selectable_label(
+                                self.camera.show_cheer_overlay,
+                                "[Overlay] Toggle CheerBot Morale Aura Rings",
+                            )
+                            .clicked()
+                    {
+                        toggle_cheer = true;
+                    }
+                    if matches("overlay heat congestion corridor map")
+                        && ui
+                            .selectable_label(
+                                self.camera.show_congestion_overlay,
+                                "[Overlay] Toggle A* Corridor Congestion Heat Map",
+                            )
+                            .clicked()
+                    {
+                        toggle_heat = true;
+                    }
+
+                    ui.separator();
+                    if matches("pause resume simulation space")
+                        && ui.button("[Speed] Toggle Pause / Resume (Space)").clicked()
+                    {
+                        toggle_pause = true;
+                    }
+                    for (lbl, spd) in [
+                        ("Speed 1x Normal", 1.0f32),
+                        ("Speed 2x Fast", 2.0f32),
+                        ("Speed 4x Hyper", 4.0f32),
+                    ] {
+                        if matches(lbl)
+                            && ui
+                                .selectable_label((self.sim_speed - spd).abs() < 0.1, format!("[Speed] {lbl}"))
+                                .clicked()
+                        {
+                            speed_choice = Some(spd);
+                        }
+                    }
+
+                    ui.separator();
+                    if matches("export kpi telemetry digest json throughput bottleneck energy")
+                        && ui.button("[Export] Factory KPI Telemetry Digest (.JSON)").clicked()
+                    {
+                        export_kpi_json = true;
+                    }
+                    if matches("export kpi telemetry digest csv throughput bottleneck energy")
+                        && ui.button("[Export] Factory KPI Telemetry Digest (.CSV)").clicked()
+                    {
+                        export_kpi_csv = true;
+                    }
+                    if matches("export factory state snapshot json")
+                        && ui.button("[Export] Full Factory State Snapshot (.JSON)").clicked()
+                    {
+                        export_state_json = true;
+                    }
+                });
+            });
+
+        if let Some((lbl, preset)) = preset_choice {
+            self.apply_factory_preset(preset, lbl);
+            open = false;
+        }
+        if let Some(mode) = floor_choice {
+            self.camera.view_mode = mode;
+            open = false;
+        }
+        if reset_cam {
+            self.camera.reset_view();
+            self.status_banner = "Camera reset to default isometric view.".to_string();
+            open = false;
+        }
+        if toggle_cryo {
+            self.camera.show_suppression_overlay = !self.camera.show_suppression_overlay;
+            open = false;
+        }
+        if toggle_cheer {
+            self.camera.show_cheer_overlay = !self.camera.show_cheer_overlay;
+            open = false;
+        }
+        if toggle_heat {
+            self.camera.show_congestion_overlay = !self.camera.show_congestion_overlay;
+            open = false;
+        }
+        if toggle_pause {
+            self.paused = !self.paused;
+            open = false;
+        }
+        if let Some(spd) = speed_choice {
+            self.sim_speed = spd;
+            self.paused = false;
+            self.status_banner = format!("Simulation speed: {:.0}x", self.sim_speed);
+            open = false;
+        }
+        if export_kpi_json {
+            let p = std::path::Path::new("swarmforge_kpi_digest.json");
+            match export_kpi_digest_json(p, &self.state) {
+                Ok(()) => self.set_status(true, format!("Exported KPI digest '{}'.", p.display())),
+                Err(e) => self.set_status(false, e),
+            }
+            open = false;
+        }
+        if export_kpi_csv {
+            let p = std::path::Path::new("swarmforge_kpi_digest.csv");
+            match export_kpi_digest_csv(p, &self.state) {
+                Ok(()) => self.set_status(true, format!("Exported KPI digest '{}'.", p.display())),
+                Err(e) => self.set_status(false, e),
+            }
+            open = false;
+        }
+        if export_state_json {
+            let p = std::path::Path::new("swarmforge_save.json");
+            match export_json_file(p, &self.state) {
+                Ok(()) => self.set_status(true, format!("Exported JSON '{}'.", p.display())),
+                Err(e) => self.set_status(false, e),
+            }
+            open = false;
+        }
+        self.show_command_palette = open;
     }
 
     fn draw_about_window(&mut self, ctx: &Context) {
@@ -1281,6 +1513,42 @@ impl SwarmForgeApp {
                             self.state.push_log(msg.clone());
                             self.set_status(false, msg);
                         }
+                    }
+                }
+            }
+        });
+        ui.separator();
+        ui.label(RichText::new("KPI Telemetry Digest (Throughput, Bottlenecks, Energy)").strong());
+        ui.horizontal(|ui| {
+            if ui.button("Export KPI JSON...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("KPI JSON", &["json"])
+                    .set_file_name("swarmforge_kpi_digest.json")
+                    .save_file()
+                {
+                    match export_kpi_digest_json(&path, &self.state) {
+                        Ok(()) => {
+                            let msg = format!("Exported KPI JSON '{}'.", path.display());
+                            self.state.push_log(msg.clone());
+                            self.set_status(true, msg);
+                        }
+                        Err(e) => self.set_status(false, e),
+                    }
+                }
+            }
+            if ui.button("Export KPI CSV...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("KPI CSV", &["csv"])
+                    .set_file_name("swarmforge_kpi_digest.csv")
+                    .save_file()
+                {
+                    match export_kpi_digest_csv(&path, &self.state) {
+                        Ok(()) => {
+                            let msg = format!("Exported KPI CSV '{}'.", path.display());
+                            self.state.push_log(msg.clone());
+                            self.set_status(true, msg);
+                        }
+                        Err(e) => self.set_status(false, e),
                     }
                 }
             }
@@ -2233,5 +2501,27 @@ mod tests {
         let sc_text = collect_texts(&out_sc.shapes).join("\n");
         assert!(sc_text.contains("Keyboard & Mouse Controls"));
         assert!(sc_text.contains("Shift + Click"));
+    }
+
+    #[test]
+    fn ctrl_k_command_palette_toggles_and_escapes() {
+        let ctx = egui::Context::default();
+        let mut app = SwarmForgeApp::new_headless(GameState::new_starter_factory());
+        assert!(!app.show_command_palette);
+        let _ = run_frame_with_events_mod(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::K,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            egui::Modifiers::CTRL,
+        );
+        assert!(app.show_command_palette);
+        let _ = run_frame_with_events(&ctx, &mut app, vec![key_press(egui::Key::Escape)]);
+        assert!(!app.show_command_palette);
     }
 }

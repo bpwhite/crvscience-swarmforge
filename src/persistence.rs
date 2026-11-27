@@ -17,6 +17,7 @@
 
 use crate::model::GameState;
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
@@ -152,6 +153,227 @@ pub fn import_json_file(path: impl AsRef<Path>) -> Result<GameState, String> {
     serde_json::from_str(&raw).map_err(|e| format!("JSON parse error: {e}"))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleUtilizationRow {
+    pub id: u32,
+    pub kind: String,
+    pub floor: String,
+    pub input_buffer: u32,
+    pub output_buffer: u32,
+    pub work_progress: f32,
+    pub condition: f32,
+    pub power_draw_kw: f32,
+    pub utilization_score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactoryKpiDigest {
+    pub schema_version: String,
+    pub version: String,
+    pub elapsed_secs: f64,
+    pub tick_count: u64,
+    pub total_products_shipped: u64,
+    pub throughput_units_per_min: f64,
+    pub credits: f64,
+    pub total_revenue: f64,
+    pub research_points: f64,
+    pub layout_efficiency: f32,
+    pub swarm_coherence: f32,
+    pub robot_count: usize,
+    pub active_robot_ratio: f32,
+    pub mean_robot_energy: f32,
+    pub mean_robot_integrity: f32,
+    pub tasks_completed_total: u64,
+    pub tasks_per_robot: f64,
+    pub module_count: usize,
+    pub mean_module_utilization: f32,
+    pub avg_module_condition: f32,
+    pub bottleneck_module_id: Option<u32>,
+    pub bottleneck_module_label: String,
+    pub bottleneck_backlog_units: u32,
+    pub power_supply_kw: f32,
+    pub power_demand_kw: f32,
+    pub power_headroom_kw: f32,
+    pub power_utilization_pct: f32,
+    pub coolant_pressure_psi: f32,
+    pub energy_efficiency_units_per_kwh: f64,
+    pub modules: Vec<ModuleUtilizationRow>,
+}
+
+fn csv_escape_kpi(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+pub fn build_factory_kpi_digest(state: &GameState) -> FactoryKpiDigest {
+    let elapsed_min = (state.elapsed_secs / 60.0).max(1.0 / 60.0);
+    let throughput_units_per_min = (state.total_products_shipped as f64) / elapsed_min;
+
+    let robot_count = state.robots.len();
+    let active_robots = state
+        .robots
+        .iter()
+        .filter(|r| !matches!(r.task, crate::model::RobotTask::Idle))
+        .count();
+    let active_robot_ratio = if robot_count == 0 {
+        0.0
+    } else {
+        active_robots as f32 / robot_count as f32
+    };
+    let mean_robot_energy = if robot_count == 0 {
+        0.0
+    } else {
+        state.robots.iter().map(|r| r.energy).sum::<f32>() / robot_count as f32
+    };
+    let mean_robot_integrity = if robot_count == 0 {
+        0.0
+    } else {
+        state.robots.iter().map(|r| r.integrity).sum::<f32>() / robot_count as f32
+    };
+    let tasks_completed_total: u64 = state.robots.iter().map(|r| r.tasks_completed).sum();
+    let tasks_per_robot = if robot_count == 0 {
+        0.0
+    } else {
+        tasks_completed_total as f64 / robot_count as f64
+    };
+
+    let mut module_rows = Vec::with_capacity(state.modules.len());
+    let mut bottleneck_id: Option<u32> = None;
+    let mut bottleneck_label = "None".to_string();
+    let mut bottleneck_backlog = 0u32;
+    let mut util_sum = 0.0f32;
+    let mut cond_sum = 0.0f32;
+
+    for m in &state.modules {
+        let backlog = m.input_buffer + m.output_buffer;
+        let util = ((backlog as f32 / 8.0) + m.work_progress).clamp(0.0, 1.0);
+        util_sum += util;
+        cond_sum += m.condition;
+        if bottleneck_id.is_none() || backlog > bottleneck_backlog {
+            bottleneck_id = Some(m.id);
+            bottleneck_label = m.kind.label().to_string();
+            bottleneck_backlog = backlog;
+        }
+        module_rows.push(ModuleUtilizationRow {
+            id: m.id,
+            kind: m.kind.label().to_string(),
+            floor: m.floor.code().to_string(),
+            input_buffer: m.input_buffer,
+            output_buffer: m.output_buffer,
+            work_progress: m.work_progress,
+            condition: m.condition,
+            power_draw_kw: m.kind.power_draw_kw(),
+            utilization_score: util,
+        });
+    }
+
+    let mod_n = state.modules.len().max(1) as f32;
+    let mean_module_utilization = if state.modules.is_empty() {
+        0.0
+    } else {
+        util_sum / mod_n
+    };
+    let avg_module_condition = if state.modules.is_empty() {
+        1.0
+    } else {
+        cond_sum / mod_n
+    };
+    let power_headroom_kw = state.power_supply_kw - state.power_demand_kw;
+    let power_utilization_pct = if state.power_supply_kw > 0.0 {
+        (state.power_demand_kw / state.power_supply_kw) * 100.0
+    } else {
+        0.0
+    };
+    let kwh_consumed =
+        (state.power_demand_kw.max(0.1) as f64) * (state.elapsed_secs / 3600.0).max(1.0 / 3600.0);
+    let energy_efficiency_units_per_kwh = (state.total_products_shipped as f64) / kwh_consumed;
+
+    FactoryKpiDigest {
+        schema_version: "1.0".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        elapsed_secs: state.elapsed_secs,
+        tick_count: state.tick_count,
+        total_products_shipped: state.total_products_shipped,
+        throughput_units_per_min,
+        credits: state.credits,
+        total_revenue: state.total_revenue,
+        research_points: state.research_points,
+        layout_efficiency: state.layout_efficiency,
+        swarm_coherence: state.swarm_coherence,
+        robot_count,
+        active_robot_ratio,
+        mean_robot_energy,
+        mean_robot_integrity,
+        tasks_completed_total,
+        tasks_per_robot,
+        module_count: state.modules.len(),
+        mean_module_utilization,
+        avg_module_condition,
+        bottleneck_module_id: bottleneck_id,
+        bottleneck_module_label: bottleneck_label,
+        bottleneck_backlog_units: bottleneck_backlog,
+        power_supply_kw: state.power_supply_kw,
+        power_demand_kw: state.power_demand_kw,
+        power_headroom_kw,
+        power_utilization_pct,
+        coolant_pressure_psi: state.coolant_pressure_psi,
+        energy_efficiency_units_per_kwh,
+        modules: module_rows,
+    }
+}
+
+pub fn format_kpi_digest_csv(digest: &FactoryKpiDigest) -> String {
+    let mut lines = Vec::with_capacity(2 + digest.modules.len());
+    lines.push(
+        "scope,id,label,floor,throughput_units_per_min,utilization_score,backlog_units,condition,power_kw,energy_efficiency_units_per_kwh,active_robot_ratio,swarm_coherence"
+            .to_string(),
+    );
+    lines.push(format!(
+        "factory,0,Factory Summary,ALL,{:.4},{:.4},{},{:.4},{:.2},{:.4},{:.4},{:.3}",
+        digest.throughput_units_per_min,
+        digest.mean_module_utilization,
+        digest.bottleneck_backlog_units,
+        digest.avg_module_condition,
+        digest.power_demand_kw,
+        digest.energy_efficiency_units_per_kwh,
+        digest.active_robot_ratio,
+        digest.swarm_coherence,
+    ));
+    for m in &digest.modules {
+        lines.push(format!(
+            "module,{},{},{},{:.4},{:.4},{},{:.4},{:.2},{:.4},{:.4},{:.3}",
+            m.id,
+            csv_escape_kpi(&m.kind),
+            csv_escape_kpi(&m.floor),
+            digest.throughput_units_per_min,
+            m.utilization_score,
+            m.input_buffer + m.output_buffer,
+            m.condition,
+            m.power_draw_kw,
+            digest.energy_efficiency_units_per_kwh,
+            digest.active_robot_ratio,
+            digest.swarm_coherence,
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
+pub fn export_kpi_digest_json(path: impl AsRef<Path>, state: &GameState) -> Result<(), String> {
+    let digest = build_factory_kpi_digest(state);
+    let json = serde_json::to_string_pretty(&digest)
+        .map_err(|e| format!("KPI digest JSON serialize error: {e}"))?;
+    fs::write(path, json).map_err(|e| format!("KPI digest JSON write error: {e}"))
+}
+
+pub fn export_kpi_digest_csv(path: impl AsRef<Path>, state: &GameState) -> Result<(), String> {
+    let digest = build_factory_kpi_digest(state);
+    let csv = format_kpi_digest_csv(&digest);
+    fs::write(path, csv).map_err(|e| format!("KPI digest CSV write error: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +431,37 @@ mod tests {
 
         let bad_dir = std::env::temp_dir().join("swarmforge_nonexistent_dir_xyz_99999").join("out.json");
         assert!(export_json_file(&bad_dir, &state).is_err());
+    }
+
+    #[test]
+    fn factory_kpi_telemetry_digest_json_and_csv_capture_throughput_bottlenecks_and_energy() {
+        let mut state = GameState::new_multi_floor_factory();
+        for _ in 0..80 {
+            crate::assembly::tick_factory(&mut state, 0.1);
+        }
+        let digest = build_factory_kpi_digest(&state);
+        assert_eq!(digest.module_count, state.modules.len());
+        assert_eq!(digest.robot_count, state.robots.len());
+        assert!(digest.power_supply_kw > 0.0);
+        assert!(digest.bottleneck_module_id.is_some());
+        assert!(digest.mean_robot_energy > 0.0);
+        assert!(digest.avg_module_condition > 0.0);
+
+        let tmp = std::env::temp_dir().join(format!("swarmforge_kpi_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("mkdir");
+        let json_p = tmp.join("kpi.json");
+        let csv_p = tmp.join("kpi.csv");
+        export_kpi_digest_json(&json_p, &state).expect("export kpi json");
+        export_kpi_digest_csv(&csv_p, &state).expect("export kpi csv");
+
+        let parsed: FactoryKpiDigest =
+            serde_json::from_str(&fs::read_to_string(&json_p).expect("read json")).expect("parse");
+        assert_eq!(parsed.module_count, digest.module_count);
+        let csv_raw = fs::read_to_string(&csv_p).expect("read csv");
+        // 1 header + 1 factory summary + N modules
+        assert_eq!(csv_raw.lines().count(), 2 + state.modules.len());
+        assert!(csv_raw.contains("energy_efficiency_units_per_kwh"));
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

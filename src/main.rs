@@ -22,7 +22,9 @@ use swarmforge::app::SwarmForgeApp;
 use swarmforge::assembly::tick_factory;
 use swarmforge::model::GameState;
 use swarmforge::navigation::enforce_spacing_and_migrate;
-use swarmforge::persistence::{export_json_file, import_json_file};
+use swarmforge::persistence::{
+    export_json_file, export_kpi_digest_csv, export_kpi_digest_json, import_json_file,
+};
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -52,6 +54,14 @@ struct Cli {
 
     #[arg(long)]
     export_json: Option<PathBuf>,
+
+    /// Export factory throughput, bottleneck utilization & swarm energy-efficiency KPI digest JSON
+    #[arg(long)]
+    export_kpi_json: Option<PathBuf>,
+
+    /// Export factory throughput, bottleneck utilization & swarm energy-efficiency KPI digest CSV
+    #[arg(long)]
+    export_kpi_csv: Option<PathBuf>,
 
     /// Render an offscreen 1600x1000 RGBA PNG screenshot without opening a GUI window
     #[arg(long)]
@@ -95,6 +105,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref out) = cli.export_json {
             export_json_file(out, &state)?;
             println!("Exported state JSON to {}", out.display());
+        }
+        if let Some(ref kpi_json) = cli.export_kpi_json {
+            export_kpi_digest_json(kpi_json, &state)?;
+            println!("Exported KPI digest JSON to {}", kpi_json.display());
+        }
+        if let Some(ref kpi_csv) = cli.export_kpi_csv {
+            export_kpi_digest_csv(kpi_csv, &state)?;
+            println!("Exported KPI digest CSV to {}", kpi_csv.display());
+        }
+        return Ok(());
+    }
+
+    if cli.export_kpi_json.is_some() || cli.export_kpi_csv.is_some() {
+        if let Some(ref kpi_json) = cli.export_kpi_json {
+            export_kpi_digest_json(kpi_json, &state)?;
+            println!("Exported KPI digest JSON to {}", kpi_json.display());
+        }
+        if let Some(ref kpi_csv) = cli.export_kpi_csv {
+            export_kpi_digest_csv(kpi_csv, &state)?;
+            println!("Exported KPI digest CSV to {}", kpi_csv.display());
         }
         return Ok(());
     }

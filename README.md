@@ -40,7 +40,8 @@ All single-key shortcuts automatically yield when typing in any text field (`!ct
 | `Secondary-Drag` | Pan viewport freely |
 | `Scroll Wheel` | Zoom camera (`6.0x..95.0x`) |
 | `Shift + Click` | Continuous bay placement while `Click Floor` mode is armed |
-| `Esc` | Dismiss About -> Cancel placement mode -> Deselect entity |
+| `Ctrl+K` / `Cmd+K` | Open fuzzy Command Palette across factory blueprints, overlays, speed presets & KPI exports |
+| `Esc` | Dismiss Command Palette / About -> Cancel placement mode -> Deselect entity |
 | `F1` | Toggle About & Shortcuts Cheat Sheet modal |
 
 ## Quick Start & CLI Flags
@@ -68,12 +69,14 @@ cargo run --release -- --headless-screenshot validation/view1.png --screenshot-v
 | `--import-json <PATH>` | — | Load initial `GameState` from JSON snapshot |
 | `--headless-ticks <N>` | — | Step simulation `N` ticks (`dt = 0.1 s`) headlessly and print summary |
 | `--export-json <PATH>` | — | Export final state JSON after `--headless-ticks` |
+| `--export-kpi-json <PATH>` | — | Export factory throughput, bottleneck utilization & swarm energy-efficiency KPI digest JSON |
+| `--export-kpi-csv <PATH>` | — | Export factory throughput, bottleneck utilization & swarm energy-efficiency KPI digest CSV |
 | `--headless-screenshot <PATH>` | — | Render `1600x1000` offscreen RGBA PNG without opening a window |
 | `--screenshot-view <1\|2\|3>` | `1` | Select preset camera/scene for `--headless-screenshot` |
 
 ## Validation Suite & Empirical Metrics
 
-Run `$env:CARGO_BUILD_JOBS='4'; cargo test --all-targets` (`25` unit tests in `src/lib.rs`, `2` integration tests in `tests/integration_r2.rs`):
+Run `$env:CARGO_BUILD_JOBS='2'; cargo test --release` (`27` unit tests across `src/`, `2` integration tests in `tests/integration_r2.rs`):
 
 | Test / Module | Verified Scientific / System Metric |
 |---|---|
